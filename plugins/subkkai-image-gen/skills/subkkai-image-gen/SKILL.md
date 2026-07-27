@@ -16,21 +16,40 @@ Never assume the plugin lives under `$HOME/plugins` or that the shell's current
 directory is the plugin root; this keeps marketplace installations portable on
 Windows, macOS, and Linux.
 
-## Output rules
+## Response rules
 
-1. Show script stdout to the user as the primary result.
-2. Do not reveal full API keys. Only key previews are safe.
-3. After successful generation or editing, display the saved image path and embed the image when the client supports local image rendering.
-4. Do not ask for confirmation in quick single-image generation or editing. Batch generation requires confirmation.
-5. When this file marks a message with `Original output`, show that quoted message to the user exactly; do not rewrite, summarize, or remove emoji/tables.
-6. If the user pastes an API key, never repeat the full key in chat. Pass it
+1. Treat single-image generation and editing as a lightweight visible-status
+   path. Start with one compact message: `🎨 正在生成。` or `✏️ 正在编辑。`
+2. Run the update check and `--get-config` silently. Do not narrate the plan,
+   selected plugin, saved configuration, command, task ID, or post-generation
+   file checks.
+3. Keep generation feedback compact but visible. The script may show the
+   short prompt preview, effective resolution, a throttled
+   elapsed-time/progress counter, and a completion line. Run generation and
+   editing commands with PTY/TTY enabled when the shell tool supports it so the
+   counter refreshes in place on one command-card line. Do not send periodic
+   progress messages in chat. Without TTY support, let the script fall back to
+   one sparse status line every 60 seconds.
+4. After success, show one compact completion line and immediately embed the
+   saved image. Add the saved path only when useful or requested. Do not add
+   explanations, tips, teaching sections, verification narration, or follow-up
+   questions after a successful result.
+5. Do not inspect, critique, or describe a generated image with another visual
+   tool unless the user explicitly asks for image review or verification.
+6. Do not ask for confirmation in quick single-image generation or editing.
+   Batch generation requires confirmation.
+7. Keep necessary detail only for first-time setup, settings, batch
+   confirmation, update notices, and actionable errors.
+8. Do not reveal full API keys. Only key previews are safe.
+9. When this file marks a message with `Original output`, show that quoted message to the user exactly; do not rewrite, summarize, or remove emoji/tables.
+10. If the user pastes an API key, never repeat the full key in chat. Pass it
    through stdin to `--set-key-stdin`; never place the full key in a command
    argument, log line, or prompt. Show only the script's masked preview.
-7. If the update-check script prints a notice, show that notice exactly once at
-   the top of the response, then continue the user's image request without
-   asking for confirmation or delaying generation.
-8. Never install an update merely because one is available. Update only after
-   the user explicitly asks to update the plugin.
+11. If the update-check script prints a notice, show that notice exactly once at
+    the top of the response, then continue the user's image request without
+    asking for confirmation or delaying generation.
+12. Never install an update merely because one is available. Update only after
+    the user explicitly asks to update the plugin.
 
 ## Entry logic
 
@@ -183,9 +202,10 @@ node "$SCRIPT" --prompt "<prompt>" [--quality Q] [--ratio R] [--count N]
 
 Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requested
 them. Otherwise omit these flags and let the script use saved quick mode. The
-script creates a Subkkai task, reports meaningful status changes while polling,
-saves the final image atomically, and prints the output path. After success,
-embed the local image instead of showing only a path.
+script creates a Subkkai task, saves the final image atomically, and prints the
+output path. After success, embed the local image instead of showing only a
+path. Do not pass `--verbose` unless the user asks for diagnostics or detailed
+progress.
 
 ## Branch C: Modify config
 
@@ -309,6 +329,8 @@ node "$SCRIPT" --edit --image "<image_path>" --prompt "<edit instruction>" [--qu
 ```
 
 The script uploads the image through `multipart/form-data` using field `image[]`, creates an edit task, polls for completion, and saves the result.
+Use the same fast response rules as Branch B and do not run a separate visual
+inspection unless the user requests one.
 
 ## Subkkai API contract
 

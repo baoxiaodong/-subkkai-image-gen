@@ -23,6 +23,24 @@ Restart Codex, then use:
 [@subkkai-image-gen](plugin://subkkai-image-gen@subkkai) 我想生成一些图片
 ```
 
+## Fast response behavior
+
+Normal single-image generation and editing show a short prompt preview, a
+compact start line with the effective resolution, a one-line live timer when a
+TTY is available, a completion line, and then the finished image. Non-TTY
+environments fall back to one status line every 60 seconds. Update checks,
+configuration reads, task IDs, and automatic visual review stay out of the
+user-facing response. Use `--verbose` only when task IDs and additional
+diagnostics are needed.
+
+## v0.1.2 更新内容
+
+- 生图和改图保留提示词、规格、动态计时与完成耗时，但不再解释内部执行流程。
+- TTY 中的“生成中”秒数在同一行动态更新，不会每次新增一行。
+- 非 TTY 环境采用每 60 秒一次的低频状态提示。
+- 修复进度停在 `0s`，并取消默认自动验图。
+- 插件详情页新增 [Subkkai 官网](https://subkkai.com/)。
+
 ## Updating existing installations
 
 The plugin does not force a silent update or inject an arbitrary HTML popup.
@@ -86,7 +104,7 @@ supports them.
 - Single-image generation and 1K/2K/4K size presets.
 - Existing-image editing for PNG, JPEG, and WebP inputs.
 - Batch generation of up to 20 prompts with up to 10 workers.
-- Status-change progress feedback while a task is queued or processing.
+- One-line live TTY progress with a sparse 60-second non-TTY fallback.
 - Batch filenames numbered in prompt order (`img_01_...`, `img_02_...`).
 - Local image output with bounded downloads and actionable, sanitized errors.
 

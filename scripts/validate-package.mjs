@@ -29,6 +29,7 @@ assert.equal(marketplace.plugins?.[0]?.name, manifest.name);
 assert.equal(marketplace.plugins?.[0]?.source?.path, "./plugins/subkkai-image-gen");
 assert.match(manifest.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/);
 assert.equal(manifest.skills, "./skills/");
+assert.equal(manifest.interface?.websiteURL, "https://subkkai.com/");
 
 assertFile(manifestPath, "plugin manifest");
 assertFile(join(pluginRoot, "assets", "logo.png"), "plugin logo");
@@ -46,5 +47,10 @@ const skillText = readFileSync(skillPath, "utf8");
 assert.match(skillText, /Resolve `\.\.\/\.\.\/scripts\/generate\.mjs`/);
 assert.match(skillText, /`\.\.\/\.\.\/scripts\/check-update\.mjs`/);
 assert.doesNotMatch(skillText, /SCRIPT=\"\$HOME\/plugins\/subkkai-image-gen/);
+assert.match(skillText, /Start with one compact message/);
+assert.match(skillText, /Keep generation feedback compact but visible/);
+assert.match(skillText, /short prompt preview/);
+assert.match(skillText, /PTY\/TTY enabled/);
+assert.match(skillText, /Do not inspect, critique, or describe a generated image/);
 
 console.log("Package validation passed.");

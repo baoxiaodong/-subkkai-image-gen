@@ -18,12 +18,14 @@ import { fileURLToPath } from "node:url";
 import {
   AppError,
   createEditTask,
+  createLiveProgress,
   friendlyErrorMessage,
   loadConfig,
   main,
   normalizeBaseUrl,
   parseArgs,
   pollTask,
+  reportTaskProgress,
   readBatchPrompts,
   requestJson,
   saveConfig,
@@ -36,6 +38,7 @@ const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT_PATH = join(REPO_ROOT, "plugins", "subkkai-image-gen", "scripts", "generate.mjs");
+let nextTestPort = 30_000 + (process.pid % 10_000);
 
 function freshEnv() {
   const root = mkdtempSync(join(tmpdir(), "subkkai-image-gen-test-"));
@@ -75,19 +78,38 @@ function restoreEnv(root, previous) {
 }
 
 async function startServer(handler) {
-  const server = createServer((request, response) => {
-    Promise.resolve(handler(request, response)).catch((error) => {
-      response.statusCode = 500;
-      response.end(JSON.stringify({ message: error.message }));
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const server = createServer((request, response) => {
+      Promise.resolve(handler(request, response)).catch((error) => {
+        response.statusCode = 500;
+        response.end(JSON.stringify({ message: error.message }));
+      });
     });
-  });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const address = server.address();
-  return {
-    server,
-    base: `http://127.0.0.1:${address.port}`,
-  };
+    const port = nextTestPort;
+    nextTestPort = nextTestPort >= 49_999 ? 30_000 : nextTestPort + 1;
+    try {
+      await new Promise((resolveListening, rejectListening) => {
+        const onError = (error) => {
+          server.off("listening", onListening);
+          rejectListening(error);
+        };
+        const onListening = () => {
+          server.off("error", onError);
+          resolveListening();
+        };
+        server.once("error", onError);
+        server.once("listening", onListening);
+        server.listen(port, "127.0.0.1");
+      });
+      return {
+        server,
+        base: `http://127.0.0.1:${port}`,
+      };
+    } catch (error) {
+      if (error?.code !== "EADDRINUSE") throw error;
+    }
+  }
+  throw new Error("Unable to allocate a fetch-safe local test port.");
 }
 
 async function stopServer(server) {
@@ -235,7 +257,8 @@ test("reports meaningful task status changes during long generation", async () =
   const { server, base } = await startServer(async (request, response) => {
     if (request.url === "/v1/image-tasks/task-progress") {
       polls += 1;
-      if (polls === 1) return json(response, 200, { status: "processing", progress: 42 });
+      if (polls === 1) return json(response, 200, { status: "queued" });
+      if (polls === 2) return json(response, 200, { status: "processing", progress: 42 });
       return json(response, 200, { status: "succeeded", response: { data: [] } });
     }
     return json(response, 404, { message: "not found" });
@@ -245,13 +268,87 @@ test("reports meaningful task status changes during long generation", async () =
   console.log = (...values) => logs.push(values.join(" "));
   try {
     await pollTask({ apiBase: base, apiKey: "sk-test-key", taskId: "task-progress" });
-    assert.equal(polls, 2);
-    assert.match(logs.join("\n"), /任务状态：生成中 42%/);
+    assert.equal(polls, 3);
+    assert.match(logs.join("\n"), /⏳ 排队中/);
+    assert.match(logs.join("\n"), /⏳ 生成中 · 42%/);
   } finally {
     console.log = originalLog;
     await stopServer(server);
     restoreEnv(root, previous);
   }
+});
+
+test("refreshes compact progress once per minute without noisy polling", () => {
+  const originalLog = console.log;
+  const logs = [];
+  console.log = (...values) => logs.push(values.join(" "));
+  try {
+    let report = reportTaskProgress("processing", { progress: 42 }, 0, null, 0);
+    report = reportTaskProgress("processing", { progress: 50 }, 0, report, 30_000);
+    assert.equal(logs.length, 0);
+    report = reportTaskProgress("processing", { progress: 55 }, 0, report, 60_000);
+    reportTaskProgress("processing", { progress: 80 }, 0, report, 61_000);
+    assert.deepEqual(logs, ["⏳ 生成中 · 55% · 1m"]);
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test("avoids a duplicate zero-second generation status", () => {
+  const originalLog = console.log;
+  const logs = [];
+  console.log = (...values) => logs.push(values.join(" "));
+  try {
+    let report = reportTaskProgress("processing", {}, 0, null, 0);
+    assert.equal(logs.length, 0);
+    report = reportTaskProgress("processing", {}, 0, report, 59_000);
+    assert.equal(logs.length, 0);
+    reportTaskProgress("processing", {}, 0, report, 60_000);
+    assert.deepEqual(logs, ["⏳ 生成中 · 1m"]);
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test("updates the TTY timer in place without adding lines", () => {
+  let currentNow = 0;
+  let tick = null;
+  let cleared = false;
+  const writes = [];
+  const timer = { unref() {} };
+  const output = {
+    isTTY: true,
+    write(value) {
+      writes.push(value);
+      return true;
+    },
+  };
+
+  const progress = createLiveProgress({
+    startedAt: 0,
+    activityLabel: "生成中",
+    output,
+    now: () => currentNow,
+    setIntervalFn(callback) {
+      tick = callback;
+      return timer;
+    },
+    clearIntervalFn(value) {
+      assert.equal(value, timer);
+      cleared = true;
+    },
+  });
+
+  assert.ok(progress);
+  assert.equal(writes[0], "\x1b[2K\r⏳ 生成中 · 0s");
+  progress.update("processing", { progress: 42 });
+  currentNow = 1_000;
+  tick();
+  assert.equal(writes.at(-1), "\x1b[2K\r⏳ 生成中 · 42% · 1s");
+  assert.ok(writes.every((value) => !value.includes("\n")));
+  progress.stop();
+  assert.equal(cleared, true);
+  assert.equal(writes.at(-1), "\x1b[2K\r");
 });
 
 test("runs a complete generation flow against a local mock API", async () => {
@@ -273,6 +370,9 @@ test("runs a complete generation flow against a local mock API", async () => {
     return json(response, 404, { message: "not found" });
   });
 
+  const originalLog = console.log;
+  const logs = [];
+  console.log = (...values) => logs.push(values.join(" "));
   try {
     saveConfig({ apiKey: "sk-test-key", apiBase: base });
     const outputDir = join(root, "generated");
@@ -282,7 +382,14 @@ test("runs a complete generation flow against a local mock API", async () => {
     const files = await (await import("node:fs/promises")).readdir(outputDir);
     assert.equal(files.length, 1);
     assert.ok(readFileSync(join(outputDir, files[0])).subarray(0, 8).equals(PNG_SIGNATURE));
+    const output = logs.join("\n");
+    assert.match(output, /🎨 正在生成 · 2K · 竖版 \(1152x2048\)/);
+    assert.match(output, /📝 a red apple/);
+    assert.match(output, /✅ 生成完成/);
+    assert.match(output, /📍/);
+    assert.doesNotMatch(output, /任务状态|🆔/);
   } finally {
+    console.log = originalLog;
     await stopServer(server);
     restoreEnv(root, previous);
   }

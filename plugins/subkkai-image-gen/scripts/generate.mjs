@@ -22,6 +22,7 @@ const TASK_TIMEOUT_MS = 300_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const INITIAL_POLL_MS = 700;
 const MAX_POLL_MS = 8_000;
+const PROGRESS_HEARTBEAT_MS = 60_000;
 const MAX_PROMPT_LENGTH = 8_000;
 const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
 const MAX_JSON_BYTES = 100 * 1024 * 1024;
@@ -646,11 +647,19 @@ function extractTaskError(task, apiKey = "") {
   return sanitizeText(code ? `${code}: ${message}` : message, [apiKey]);
 }
 
-async function pollTask({ apiBase, apiKey, taskId }) {
-  const startedAt = Date.now();
-  const deadline = startedAt + TASK_TIMEOUT_MS;
+async function pollTask({
+  apiBase,
+  apiKey,
+  taskId,
+  progressStartedAt = Date.now(),
+  activityLabel = "生成中",
+  liveProgress = null,
+  reportProgress = true,
+}) {
+  const pollStartedAt = Date.now();
+  const deadline = pollStartedAt + TASK_TIMEOUT_MS;
   let delay = INITIAL_POLL_MS;
-  let lastReportedStatus = "";
+  let progressReport = null;
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
     const task = await requestJson(`${apiBase}/v1/image-tasks/${encodeURIComponent(taskId)}`, {
@@ -666,10 +675,13 @@ async function pollTask({ apiBase, apiKey, taskId }) {
     });
 
     const status = extractTaskStatus(task);
-    lastReportedStatus = reportTaskProgress(status, task, startedAt, lastReportedStatus);
     if (["succeeded", "success", "completed"].includes(status)) return task;
     if (["failed", "canceled", "cancelled", "error", "expired", "rejected"].includes(status)) {
       throw new AppError("TASK_FAILED", `Task ${status}: ${extractTaskError(task, apiKey)}` );
+    }
+    if (liveProgress) liveProgress.update(status, task);
+    else if (reportProgress) {
+      progressReport = reportTaskProgress(status, task, progressStartedAt, progressReport, Date.now(), activityLabel);
     }
 
     const waitMs = Math.min(delay, Math.max(0, deadline - Date.now()));
@@ -715,42 +727,164 @@ const TASK_STATUS_LABELS = {
   in_progress: "生成中",
 };
 
-function reportTaskProgress(status, task, startedAt, previousStatus) {
-  if (!status || status === previousStatus || ["succeeded", "success", "completed"].includes(status)) return previousStatus;
+function extractTaskProgress(task) {
   const progressValue = task?.progress ?? task?.data?.progress ?? task?.data?.task?.progress;
-  const progress = Number(progressValue);
-  const label = TASK_STATUS_LABELS[status] || "处理中";
-  const suffix = Number.isFinite(progress) && progress >= 0 && progress <= 100 ? ` ${Math.round(progress)}%` : "";
-  console.log(`⏳ 任务状态：${label}${suffix}（已用 ${Math.round((Date.now() - startedAt) / 1_000)}s）`);
-  return status;
+  const parsedProgress = Number(progressValue);
+  return Number.isFinite(parsedProgress) && parsedProgress >= 0 && parsedProgress <= 100
+    ? Math.round(parsedProgress)
+    : null;
 }
 
-async function runGeneration({ apiBase, apiKey, prompt, size, outputDir, prefix = "img" }) {
+function taskStatusLabel(status, activityLabel = "生成中") {
+  if (["processing", "running", "in_progress"].includes(status)) return activityLabel;
+  return TASK_STATUS_LABELS[status] || "处理中";
+}
+
+function formatElapsedTime(startedAt, now = Date.now()) {
+  const totalSeconds = Math.max(0, Math.round((now - startedAt) / 1_000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function createLiveProgress({
+  startedAt = Date.now(),
+  activityLabel = "生成中",
+  output = process.stdout,
+  now = Date.now,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+} = {}) {
+  if (output?.isTTY !== true) return null;
+  let currentStatus = "processing";
+  let currentProgress = null;
+  let stopped = false;
+
+  const render = () => {
+    if (stopped) return;
+    const parts = [`⏳ ${taskStatusLabel(currentStatus, activityLabel)}`];
+    if (currentProgress !== null) parts.push(`${currentProgress}%`);
+    parts.push(formatElapsedTime(startedAt, now()));
+    output.write(`\x1b[2K\r${parts.join(" · ")}`);
+  };
+
+  render();
+  const timer = setIntervalFn(render, 1_000);
+  timer?.unref?.();
+
+  return {
+    update(status, task) {
+      if (status) currentStatus = status;
+      currentProgress = extractTaskProgress(task);
+      render();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearIntervalFn(timer);
+      output.write("\x1b[2K\r");
+    },
+  };
+}
+
+function reportTaskProgress(
+  status,
+  task,
+  startedAt,
+  previousReport = null,
+  now = Date.now(),
+  activityLabel = "生成中",
+) {
+  if (!status || ["succeeded", "success", "completed"].includes(status)) return previousReport;
+  const progress = extractTaskProgress(task);
+  const elapsedSeconds = Math.max(0, Math.round((now - startedAt) / 1_000));
+  const initialSilentGeneration = !previousReport
+    && ["processing", "running", "in_progress"].includes(status)
+    && elapsedSeconds < 1;
+  if (initialSilentGeneration) return { status, progress, reportedAt: now };
+  const statusChanged = status !== previousReport?.status;
+  const heartbeatDue = previousReport && now - previousReport.reportedAt >= PROGRESS_HEARTBEAT_MS;
+  if (!statusChanged && !heartbeatDue) return previousReport;
+  const parts = [`⏳ ${taskStatusLabel(status, activityLabel)}`];
+  if (progress !== null) parts.push(`${progress}%`);
+  if (elapsedSeconds > 0) parts.push(formatElapsedTime(startedAt, now));
+  console.log(parts.join(" · "));
+  return { status, progress, reportedAt: now };
+}
+
+async function runGeneration({
+  apiBase,
+  apiKey,
+  prompt,
+  size,
+  outputDir,
+  prefix = "img",
+  progressOutput = true,
+}) {
   const startedAt = Date.now();
-  const taskId = await createGenerationTask({ apiBase, apiKey, prompt, size, n: 1 });
-  console.log(`🆔 任务: ${taskId}`);
-  const task = await pollTask({ apiBase, apiKey, taskId });
-  const items = extractImageItems(task);
-  if (!items.length) throw new AppError("INVALID_IMAGE_RESPONSE", "生成任务完成，但响应中没有图片数据。" );
-  const saved = [];
-  for (const item of items) saved.push(await saveImageItem(item, outputDir, prefix));
-  return { elapsed: Date.now() - startedAt, taskId, saved };
+  const liveProgress = progressOutput && !verboseOutputEnabled()
+    ? createLiveProgress({ startedAt, activityLabel: "生成中" })
+    : null;
+  try {
+    const taskId = await createGenerationTask({ apiBase, apiKey, prompt, size, n: 1 });
+    if (verboseOutputEnabled()) console.log(`🆔 任务: ${taskId}`);
+    const task = await pollTask({
+      apiBase,
+      apiKey,
+      taskId,
+      progressStartedAt: startedAt,
+      activityLabel: "生成中",
+      liveProgress,
+      reportProgress: progressOutput,
+    });
+    const items = extractImageItems(task);
+    if (!items.length) throw new AppError("INVALID_IMAGE_RESPONSE", "生成任务完成，但响应中没有图片数据。" );
+    const saved = [];
+    for (const item of items) saved.push(await saveImageItem(item, outputDir, prefix));
+    return { elapsed: Date.now() - startedAt, taskId, saved };
+  } finally {
+    liveProgress?.stop();
+  }
 }
 
 async function runEdit({ apiBase, apiKey, imagePath, prompt, size, outputDir }) {
   const startedAt = Date.now();
-  const taskId = await createEditTask({ apiBase, apiKey, imagePath, prompt, size });
-  console.log(`🆔 任务: ${taskId}`);
-  const task = await pollTask({ apiBase, apiKey, taskId });
-  const items = extractImageItems(task);
-  if (!items.length) throw new AppError("INVALID_IMAGE_RESPONSE", "编辑任务完成，但响应中没有图片数据。" );
-  const saved = [];
-  for (const item of items) saved.push(await saveImageItem(item, outputDir, "edit"));
-  return { elapsed: Date.now() - startedAt, taskId, saved };
+  const liveProgress = verboseOutputEnabled()
+    ? null
+    : createLiveProgress({ startedAt, activityLabel: "编辑中" });
+  try {
+    const taskId = await createEditTask({ apiBase, apiKey, imagePath, prompt, size });
+    if (verboseOutputEnabled()) console.log(`🆔 任务: ${taskId}`);
+    const task = await pollTask({
+      apiBase,
+      apiKey,
+      taskId,
+      progressStartedAt: startedAt,
+      activityLabel: "编辑中",
+      liveProgress,
+    });
+    const items = extractImageItems(task);
+    if (!items.length) throw new AppError("INVALID_IMAGE_RESPONSE", "编辑任务完成，但响应中没有图片数据。" );
+    const saved = [];
+    for (const item of items) saved.push(await saveImageItem(item, outputDir, "edit"));
+    return { elapsed: Date.now() - startedAt, taskId, saved };
+  } finally {
+    liveProgress?.stop();
+  }
+}
+
+function verboseOutputEnabled() {
+  return process.env.SUBKKAI_IMAGE_GEN_VERBOSE === "1";
+}
+
+function compactPromptPreview(prompt, maxLength = 48) {
+  const normalized = sanitizeText(prompt).replace(/\s+/g, " ").trim();
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized;
 }
 
 function promptPreview(prompt) {
-  if (process.env.SUBKKAI_IMAGE_GEN_VERBOSE === "1") return `: "${sanitizeText(prompt).slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`;
+  if (verboseOutputEnabled()) return `: "${sanitizeText(prompt).slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`;
   return "";
 }
 
@@ -766,7 +900,15 @@ async function runBatch({ apiBase, apiKey, prompts, size, concurrency, outputDir
       const prompt = prompts[index];
       console.log(`[${index + 1}/${prompts.length}] 生成中${promptPreview(prompt)}`);
       try {
-        const result = await runGeneration({ apiBase, apiKey, prompt, size, outputDir, prefix: `img_${String(index + 1).padStart(2, "0")}` });
+        const result = await runGeneration({
+          apiBase,
+          apiKey,
+          prompt,
+          size,
+          outputDir,
+          prefix: `img_${String(index + 1).padStart(2, "0")}`,
+          progressOutput: false,
+        });
         results[index] = { prompt, ok: true, ...result };
         console.log(`✅ [${index + 1}/${prompts.length}] ${(result.elapsed / 1_000).toFixed(1)}s`);
       } catch (error) {
@@ -1075,10 +1217,11 @@ async function main(argv = process.argv.slice(2)) {
 
   if (flags.edit) {
     const { quality, ratio, size } = resolveModeParams(flags, config.quickMode);
-    console.log(`✏️ 编辑中: ${basename(flags.image)}`);
-    console.log(`🎨 ${quality} ${RATIO_NAMES[ratio]} (${size})`);
+    console.log(`✏️ 正在编辑 · ${quality} · ${RATIO_NAMES[ratio]} (${size})`);
+    console.log(`📝 ${compactPromptPreview(prompts[0])}`);
+    if (verboseOutputEnabled()) console.log(`🖼️ ${basename(flags.image)}`);
     const result = await runEdit({ apiBase, apiKey, imagePath: flags.image, prompt: prompts[0], size, outputDir });
-    console.log(`✅ ${(result.elapsed / 1_000).toFixed(1)}s`);
+    console.log(`✅ 编辑完成 · ${(result.elapsed / 1_000).toFixed(1)}s`);
     for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
     return;
   }
@@ -1105,10 +1248,10 @@ async function main(argv = process.argv.slice(2)) {
     return;
   }
 
-  console.log(`⏳ 生成中...`);
-  console.log(`🎨 ${quality} ${RATIO_NAMES[ratio]} (${size})`);
+  console.log(`🎨 正在生成 · ${quality} · ${RATIO_NAMES[ratio]} (${size})`);
+  console.log(`📝 ${compactPromptPreview(prompts[0])}`);
   const result = await runGeneration({ apiBase, apiKey, prompt: prompts[0], size, outputDir });
-  console.log(`✅ ${(result.elapsed / 1_000).toFixed(1)}s`);
+  console.log(`✅ 生成完成 · ${(result.elapsed / 1_000).toFixed(1)}s`);
   for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
 }
 
@@ -1122,6 +1265,7 @@ export {
   SIZE_MATRIX,
   createEditTask,
   createGenerationTask,
+  createLiveProgress,
   extractImageItems,
   fetchImageResponse,
   friendlyErrorMessage,
@@ -1130,6 +1274,7 @@ export {
   normalizeBaseUrl,
   parseArgs,
   pollTask,
+  reportTaskProgress,
   requestJson,
   resolveModeParams,
   saveConfig,
