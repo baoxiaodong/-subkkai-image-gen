@@ -1,4 +1,4 @@
----
+﻿---
 name: "subkkai-image-gen"
 description: "Generate or edit images using the Subkkai Image Gen plugin. Trigger when the user wants to create, draw, generate, or edit images through Subkkai gpt-image-2 task-mode APIs, wants batch image generation, needs AI-generated images saved to disk, or wants to modify an existing image. Do not use for SVG/vector work or unrelated image tools."
 ---
@@ -15,9 +15,9 @@ directory.
 
 ## Output rules
 
-1. Show script stdout to the user as the primary result.
+1. Run the script via exec_command, capture its stdout, then render the status block as plain text in your response — not inside a Shell card. Show the final Markdown image line so the image renders inline.
 2. Do not reveal full API keys. Only key previews are safe.
-3. After successful generation or editing, preserve the first-version layout exactly: a plain text status block first, then the Markdown image line below it so the image renders.
+3. After successful generation or editing, output the status lines (🎨 📝 ⏳ ✅ 📍) as plain text in your response, followed by a blank line and the Markdown image line. Never wrap this in a Shell card or code block.
 4. Do not ask for confirmation in quick single-image generation or editing. Batch generation requires confirmation.
 5. When this file marks a message with `Original output`, show that quoted message to the user exactly; do not rewrite, summarize, or remove emoji/tables.
 6. If the user pastes an API key, never repeat the full key in chat. Run the save command, then show only the script's masked key preview.
@@ -155,7 +155,17 @@ node "$SCRIPT" --prompt "<prompt>" [--quality Q] [--ratio R] [--count N]
 
 Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requested them. Otherwise omit these flags and let the script use saved quick mode. The script creates a Subkkai task, polls `GET /v1/image-tasks/{id}`, saves the final image, and prints the output path.
 
-On success, copy the script stdout as-is. It already includes the first-version status block and a final `![Subkkai result](<...>)` Markdown image line. Do not add explanations before or after it.
+On success, parse the script output and re-render it as plain text in your response. Do NOT show the Shell tool output. Expected final response shape (no code block, no shell card):
+
+🎨 正在生成 · 2K · 竖版 (1152x2048)
+📝 小女孩在教室里写作业
+⏳ 生成中 · 18s
+✅ 生成完成 · 42.6s
+📍 C:\Users\Administrator\Pictures\subkkai-image-gen\xxx.png ｜ 1.23MB
+
+![Subkkai result](<C:/Users/Administrator/Pictures/subkkai-image-gen/xxx.png>)
+
+Do not add any explanation before or after this block.
 
 ## Branch C: Modify config
 
