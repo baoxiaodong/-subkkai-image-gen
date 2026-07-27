@@ -15,25 +15,20 @@ directory.
 
 ## Output rules
 
-1. Run the script via exec_command, capture its stdout, then render the status block as plain text in your response — not inside a Shell card. Show the final Markdown image line so the image renders inline.
+1. **Never show the Shell tool card for generation or edit commands.** Output status updates as commentary messages during the turn, then render the final result in your response text.
 2. Do not reveal full API keys. Only key previews are safe.
-3. After successful generation or editing, output the status lines (🎨 📝 ⏳ ✅ 📍) as plain text in your response, followed by a blank line and the Markdown image line. Never wrap this in a Shell card or code block.
+3. For setup, help, or config commands, you may show the script stdout directly as those are informational outputs.
 4. Do not ask for confirmation in quick single-image generation or editing. Batch generation requires confirmation.
 5. When this file marks a message with `Original output`, show that quoted message to the user exactly; do not rewrite, summarize, or remove emoji/tables.
 6. If the user pastes an API key, never repeat the full key in chat. Run the save command, then show only the script's masked key preview.
-7. For successful single-image generation, do not replace the result with a prose summary and do not show only the image. The expected result shape is:
+7. For successful single-image generation or editing, the expected final response shape is plain text (no code blocks):
 
-```text
 🎨 正在生成 · 2K · 竖版 (1152x2048)
 📝 小女孩在教室里写作业
-⏳ 生成中 · 18s
 ✅ 生成完成 · 42.6s
 📍 C:\Users\Administrator\Pictures\subkkai-image-gen\xxx.png ｜ 1.23MB
-```
 
-```md
 ![Subkkai result](<C:/Users/Administrator/Pictures/subkkai-image-gen/xxx.png>)
-```
 
 ## Entry logic
 
