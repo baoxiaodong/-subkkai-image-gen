@@ -33,6 +33,14 @@ terminals and Codex non-TTY command cards. Other log-only pipes fall back to one
 status line every 60 seconds.
 Use `--verbose` only when task IDs and additional diagnostics are needed.
 
+## First-time setup
+
+New installations retain the complete four-step onboarding from the first
+release: API Key, default quality, ratio, and image count. The plugin saves the
+resulting quick mode locally, then resumes the user's original image request
+without asking them to repeat it. Existing installations with a saved quick
+mode keep the single-command fast path.
+
 For requests such as “edit the previous image”, the fast path is:
 
 ```powershell

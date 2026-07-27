@@ -51,8 +51,9 @@ answer and end the task. Do not call another tool, copy/move the file, Base64
 encode it, inspect it, explain the execution, or ask a follow-up question.
 
 If the CLI prints an update notice, show it once without delaying or cancelling
-the image request. If it returns `MISSING_API_KEY`, use First-time setup. If it
-returns `NO_IMAGE_AVAILABLE`, ask the user to attach an image or provide a path.
+the image request. If it returns `MISSING_API_KEY` or `MISSING_QUICK_MODE`, use
+First-time setup. If it returns `NO_IMAGE_AVAILABLE`, ask the user to attach an
+image or provide a path.
 
 ## Response rules
 
@@ -72,16 +73,91 @@ returns `NO_IMAGE_AVAILABLE`, ask the user to attach an image or provide a path.
 
 ## First-time setup
 
-When a direct command reports `MISSING_API_KEY`, ask for the user's key once.
-Never repeat it in chat or put it in a command argument. Pass it through stdin:
+First installation uses the complete four-step setup flow. It appears only when
+a direct command returns `MISSING_API_KEY` or `MISSING_QUICK_MODE`; users who
+already completed it still keep the normal one-command fast path.
+
+### Step 1 — API Key
+
+When the command returns `MISSING_API_KEY`, show this exactly:
+
+> 👋 欢迎使用 **Subkkai Image Gen**！首次使用需要快速设置一下
+>
+> 整个过程只需 30 秒，之后每次 @我 + 描述就能直接出图 ⚡
+>
+> ---
+>
+> 🔑 **第一步：请提供你的 API Key**
+>
+> 把你的 Key 提供给我，我只会把它保存到本地配置，并在回复里显示打码预览；不要把完整 Key 写进命令参数 🔒
+
+When the user provides the key, never repeat it in chat or put it in a command
+argument. Pass it through stdin:
 
 ```bash
 node "$SCRIPT" --set-key-stdin
 ```
 
-After the key is saved, immediately retry the original generation/edit command.
-The default quick settings are 2K, portrait, one image; do not force a separate
-settings wizard unless the user asks to configure defaults.
+Show the script output as-is, retain the original request, then continue to
+Step 2. Do not retry the original image request before the quick mode is saved.
+
+When the command returns `MISSING_QUICK_MODE`, skip Step 1 and start at Step 2;
+the user already has a usable Key but has not finished first-time setup.
+
+### Step 2 — Choose quality
+
+Show this exactly, then wait for the choice:
+
+> ⚡ **第二步：设置快速模式** — 以后 @我 + 描述就按这个配置直接出图！
+>
+> 🎨 选择默认 **分辨率档位**：
+>
+> | 选项 | 分辨率 | 速度 | 适合场景 |
+> |------|--------|------|----------|
+> | **1K** 🚀 | ~1百万像素 | 最快 | 草稿、缩略图、测试 |
+> | **2K** ✨ _(推荐)_ | ~4百万像素 | 平衡 | 日常使用、微信出图 |
+> | **4K** 💎 | ~8百万像素 | 较慢 | 高清大图、细节图 |
+
+Map the choice to `1K`, `2K`, or `4K`. If the user says “推荐” or “默认”, use
+`2K`, then continue to Step 3.
+
+### Step 3 — Choose ratio
+
+Show this exactly, then wait for the choice:
+
+> 📐 选择默认 **比例**：
+>
+> | 选项 | 比例 | 1K | 2K | 4K |
+> |------|------|-----|-----|-----|
+> | ⬜ **正方形** | 1:1 | 1024×1024 | 2048×2048 | 2880×2880 |
+> | 🖼️ **横版** | 16:9 / 3:2 | 1536×1024 | 2048×1152 | 3840×2160 |
+> | 📱 **竖版** _(人像推荐)_ | 9:16 / 2:3 | 1024×1536 | 1152×2048 | 2160×3840 |
+
+Map the choice to `square`, `landscape`, or `portrait`. If the user says
+“推荐” or “默认”, use `portrait`, then continue to Step 4.
+
+### Step 4 — Choose count
+
+Show this exactly, then wait for the choice:
+
+> 🔢 每次默认生成 **几张**？（1~4 张）
+>
+> 多张 = 同一描述生成不同变体，选 1 张最快 ⚡
+
+Accept only `1` through `4`. If the user says “推荐” or “默认”, use `1`.
+
+### Save and resume
+
+After all three choices are collected, run:
+
+```bash
+node "$SCRIPT" --set-quick-mode --quality <Q> --ratio <R> --count <N>
+```
+
+Show the script output as-is. If the original request contained a single-image
+generation or edit, immediately resume that original request using the saved
+settings without making the user repeat it. If it was a batch request, resume
+the normal batch confirmation from the original request instead.
 
 ## Settings
 

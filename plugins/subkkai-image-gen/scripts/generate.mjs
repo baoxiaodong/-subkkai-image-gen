@@ -813,6 +813,7 @@ function friendlyErrorMessage(error, secrets = []) {
   if (code === "TASK_TIMEOUT") return `${raw} 远端任务可能仍在运行，请稍后查询或确认后再重试。`;
   if (code === "NETWORK_TIMEOUT") return `${raw} 请检查网络或稍后重试。`;
   if (code === "MISSING_API_KEY") return `${raw} 可使用 SUBKKAI_IMAGE_GEN_API_KEY，或通过 stdin 配置。`;
+  if (code === "MISSING_QUICK_MODE") return `${raw} 请先完成画质、比例和数量的首次设置。`;
   if (code === "INVALID_PROMPT") return `${raw} 请提供非空且不超过 ${MAX_PROMPT_LENGTH} 个字符的描述。`;
   if (code === "IMAGE_TOO_LARGE") return `${raw} 请压缩图片后再编辑。`;
   return raw;
@@ -1350,6 +1351,9 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   const apiKey = getApiKey(config);
+  if (!config.quickMode) {
+    throw new AppError("MISSING_QUICK_MODE", "尚未完成首次快速模式设置。请依次选择画质、比例和数量。" );
+  }
   const apiBase = normalizeBaseUrl(config.apiBase || DEFAULT_API_BASE, { allowInsecure: config.allowInsecureApiBase === true });
   const outputDir = resolveOutputDir(flags.outputDir);
 

@@ -56,5 +56,11 @@ assert.doesNotMatch(skillText, /with PTY\/TTY enabled/);
 assert.match(skillText, /Do not inspect, critique, or describe the result/);
 assert.match(skillText, /Copy that line verbatim into the final/);
 assert.match(skillText, /Do not call another tool, copy\/move the file, Base64/);
+assert.match(skillText, /MISSING_API_KEY` or `MISSING_QUICK_MODE/);
+assert.match(skillText, /第一步：请提供你的 API Key/);
+assert.match(skillText, /第二步：设置快速模式/);
+assert.match(skillText, /选择默认 \*\*比例\*\*/);
+assert.match(skillText, /每次默认生成 \*\*几张\*\*/);
+assert.match(skillText, /--set-quick-mode --quality <Q> --ratio <R> --count <N>/);
 
 console.log("Package validation passed.");

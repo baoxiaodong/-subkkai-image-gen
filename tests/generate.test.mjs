@@ -234,6 +234,19 @@ test("saves config atomically and refuses corrupt config", () => {
   }
 });
 
+test("requires first-time quick mode setup after a key is configured", async () => {
+  const { root, previous } = freshEnv();
+  try {
+    saveConfig({ apiKey: "sk-test-key" });
+    await assert.rejects(
+      () => main(["--prompt", "first-time setup"]),
+      (error) => error?.code === "MISSING_QUICK_MODE",
+    );
+  } finally {
+    restoreEnv(root, previous);
+  }
+});
+
 test("reads API keys from stdin without echoing the full secret", () => {
   const { root, previous } = freshEnv();
   const secret = "test-secret-123456";
@@ -490,7 +503,7 @@ test("runs a complete generation flow against a local mock API", async () => {
   const logs = [];
   console.log = (...values) => logs.push(values.join(" "));
   try {
-    saveConfig({ apiKey: "sk-test-key", apiBase: base });
+    saveConfig({ apiKey: "sk-test-key", apiBase: base, quickMode: { quality: "2K", ratio: "portrait", count: 1 } });
     const outputDir = join(root, "generated");
     await main(["--prompt", "a red apple", "--output-dir", outputDir]);
     assert.equal(createRequests, 1);
@@ -541,7 +554,7 @@ test("checks for updates inside the same generation command", async () => {
     delete process.env.SUBKKAI_IMAGE_GEN_DISABLE_UPDATE_CHECK;
     process.env.SUBKKAI_IMAGE_GEN_UPDATE_URL = `${base}/manifest.json`;
     process.env.SUBKKAI_IMAGE_GEN_UPDATE_CACHE = join(root, "update-cache.json");
-    saveConfig({ apiKey: "sk-test-key", apiBase: base });
+    saveConfig({ apiKey: "sk-test-key", apiBase: base, quickMode: { quality: "2K", ratio: "portrait", count: 1 } });
 
     await main(["--prompt", "one-command update check", "--output-dir", join(root, "generated")]);
 
@@ -578,7 +591,7 @@ test("edits the latest output image in one CLI action", async () => {
   const logs = [];
   console.log = (...values) => logs.push(values.join(" "));
   try {
-    saveConfig({ apiKey: "sk-test-key", apiBase: base });
+    saveConfig({ apiKey: "sk-test-key", apiBase: base, quickMode: { quality: "2K", ratio: "portrait", count: 1 } });
     const outputDir = join(root, "edits");
     mkdirSync(outputDir, { recursive: true });
     const oldPath = join(outputDir, "old.png");
@@ -634,7 +647,7 @@ test("keeps batch outputs ordered without logging full prompts", async () => {
   console.log = (...values) => logs.push(values.join(" "));
   const previousExitCode = process.exitCode;
   try {
-    saveConfig({ apiKey: "sk-test-key", apiBase: base });
+    saveConfig({ apiKey: "sk-test-key", apiBase: base, quickMode: { quality: "2K", ratio: "portrait", count: 1 } });
     const outputDir = join(root, "batch");
     await main([
       "--batch-inline",
