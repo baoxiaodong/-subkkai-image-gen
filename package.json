@@ -1,0 +1,14 @@
+{
+  "name": "subkkai-image-gen-marketplace",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1",
+    "check": "node --check plugins/subkkai-image-gen/scripts/generate.mjs && node --check plugins/subkkai-image-gen/scripts/check-update.mjs && node --check scripts/validate-package.mjs && node --check tests/generate.test.mjs && node --check tests/update-check.test.mjs",
+    "validate": "node scripts/validate-package.mjs",
+    "verify": "npm run check && npm test && npm run validate"
+  }
+}

@@ -1,19 +1,20 @@
 ---
 name: "subkkai-image-gen"
-description: "Generate or edit images using the Subkkai Image Gen plugin. Trigger when the user wants to create, draw, generate, or edit images through Subkkai gpt-image-2 task-mode APIs, wants batch image generation, needs AI-generated images saved to disk, or wants to modify an existing image. Do not use for SVG/vector work or unrelated image tools."
+description: "Generate or edit images using the Subkkai Image Gen plugin. Trigger when the user wants to create, draw, generate, or edit images through Subkkai gpt-image-2 task-mode APIs, wants batch image generation, needs AI-generated images saved to disk, wants to modify an existing image, or asks to check or update this plugin. Do not use for SVG/vector work or unrelated image tools."
 ---
 
 # Subkkai Image Gen
 
-Use the Subkkai task-mode image APIs through `scripts/generate.mjs`.
+Use the Subkkai task-mode image APIs through the bundled `scripts/generate.mjs`.
 
 ## Script location
 
-```bash
-SCRIPT="$HOME/plugins/subkkai-image-gen/scripts/generate.mjs"
-```
-
-If developing from a local template checkout, use the checkout-relative script path instead.
+Resolve `../../scripts/generate.mjs` and `../../scripts/check-update.mjs`
+relative to the directory containing this `SKILL.md`, convert both to absolute
+paths, and refer to them as `SCRIPT` and `UPDATE_SCRIPT` respectively.
+Never assume the plugin lives under `$HOME/plugins` or that the shell's current
+directory is the plugin root; this keeps marketplace installations portable on
+Windows, macOS, and Linux.
 
 ## Output rules
 
@@ -22,11 +23,30 @@ If developing from a local template checkout, use the checkout-relative script p
 3. After successful generation or editing, display the saved image path and embed the image when the client supports local image rendering.
 4. Do not ask for confirmation in quick single-image generation or editing. Batch generation requires confirmation.
 5. When this file marks a message with `Original output`, show that quoted message to the user exactly; do not rewrite, summarize, or remove emoji/tables.
-6. If the user pastes an API key, never repeat the full key in chat. Run the save command, then show only the script's masked key preview.
+6. If the user pastes an API key, never repeat the full key in chat. Pass it
+   through stdin to `--set-key-stdin`; never place the full key in a command
+   argument, log line, or prompt. Show only the script's masked preview.
+7. If the update-check script prints a notice, show that notice exactly once at
+   the top of the response, then continue the user's image request without
+   asking for confirmation or delaying generation.
+8. Never install an update merely because one is available. Update only after
+   the user explicitly asks to update the plugin.
 
 ## Entry logic
 
-Every time this skill is triggered, start with:
+Every time this skill is triggered, first run:
+
+```bash
+node "$UPDATE_SCRIPT"
+```
+
+The checker sends no prompt, image, or API key. It checks at most once every 24
+hours, caches only version metadata, and prints nothing when no update is
+available. If it prints a notice, show it exactly before the normal response.
+If it exits with an error or prints nothing, continue silently; an update check
+must never block generation or editing.
+
+If the user explicitly asks to update, use Branch U and stop. Otherwise run:
 
 ```bash
 node "$SCRIPT" --get-config
@@ -48,13 +68,29 @@ Pick the first matching branch:
 
 | # | Condition | Branch |
 |---|-----------|--------|
-| 1 | `hasKey` is false | A: First-time setup |
-| 2 | `quickMode` is null | A2: Quick mode setup |
-| 3 | User wants settings/config changes | C: Modify config |
-| 4 | User wants batch generation | D: Batch mode |
-| 5 | User wants to edit an existing image | F: Edit image |
-| 6 | User gave a prompt | B: Quick mode |
-| 7 | No clear prompt | E: Help |
+| 1 | User explicitly asks to update this plugin | U: Update plugin |
+| 2 | `hasKey` is false | A: First-time setup |
+| 3 | `quickMode` is null | A2: Quick mode setup |
+| 4 | User wants settings/config changes | C: Modify config |
+| 5 | User wants batch generation | D: Batch mode |
+| 6 | User wants to edit an existing image | F: Edit image |
+| 7 | User gave a prompt | B: Quick mode |
+| 8 | No clear prompt | E: Help |
+
+## Branch U: Update plugin
+
+Enter this branch only when the user clearly asks to update, upgrade, or install
+the newly announced version. Run these commands sequentially:
+
+```bash
+codex plugin marketplace upgrade subkkai
+codex plugin add subkkai-image-gen@subkkai
+```
+
+If marketplace refresh fails, report the error and stop; do not remove the
+installed plugin. If installation succeeds, tell the user to start a new Codex
+thread so the newly installed skill is loaded. Show command output without
+revealing unrelated local paths or configuration values.
 
 ## Branch A: First-time setup
 
@@ -68,15 +104,16 @@ Original output:
 >
 > 🔑 **第一步：请提供你的 API Key**
 >
-> 把你的 Key 粘贴给我，我会安全保存在本地，只会在回复里显示打码预览 🔒
+> 把你的 Key 提供给我，我只会把它保存到本地配置，并在回复里显示打码预览；不要把完整 Key 写进命令参数 🔒
 
 When the user provides the key, do not echo it. Run:
 
 ```bash
-node "$SCRIPT" --set-key <USER_KEY>
+node "$SCRIPT" --set-key-stdin
 ```
 
-Show the script output as-is, then continue to Branch A2.
+Provide the key through the command's stdin, show the script output as-is,
+then continue to Branch A2. Never echo the key into chat.
 
 ## Branch A2: Quick mode setup
 
@@ -88,7 +125,7 @@ Original output:
 
 > ⚡ **第二步：设置快速模式** — 以后 @我 + 描述就按这个配置直接出图！
 >
-> 🎨 选择默认 **画质**：
+> 🎨 选择默认 **分辨率档位**：
 >
 > | 选项 | 分辨率 | 速度 | 适合场景 |
 > |------|--------|------|----------|
@@ -96,7 +133,9 @@ Original output:
 > | **2K** ✨ _(推荐)_ | ~4百万像素 | 平衡 | 日常使用、微信出图 |
 > | **4K** 💎 | ~8百万像素 | 较慢 | 高清大图、细节图 |
 
-Wait for the user to choose. Default to `2K` if the user says recommended/default.
+The CLI flag remains named `--quality` for backward compatibility, but 1K/2K/4K
+primarily selects output resolution. Wait for the user to choose. Default to
+`2K` if the user says recommended/default.
 
 ### W3: Choose ratio
 
@@ -142,7 +181,11 @@ Extract the image prompt and run:
 node "$SCRIPT" --prompt "<prompt>" [--quality Q] [--ratio R] [--count N]
 ```
 
-Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requested them. Otherwise omit these flags and let the script use saved quick mode. The script creates a Subkkai task, polls `GET /v1/image-tasks/{id}`, saves the final image, and prints the output path.
+Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requested
+them. Otherwise omit these flags and let the script use saved quick mode. The
+script creates a Subkkai task, reports meaningful status changes while polling,
+saves the final image atomically, and prints the output path. After success,
+embed the local image instead of showing only a path.
 
 ## Branch C: Modify config
 
@@ -170,7 +213,7 @@ Show current config from `--get-config`, then output this with values filled in:
 Then update only the requested part:
 
 ```bash
-node "$SCRIPT" --set-key <NEW_KEY>
+node "$SCRIPT" --set-key-stdin
 node "$SCRIPT" --set-quick-mode --quality <Q> --ratio <R> --count <N>
 node "$SCRIPT" --set-batch-mode --quality <Q> --ratio <R> --concurrency <N>
 node "$SCRIPT" --set-api-base <BASE_URL>
@@ -230,6 +273,10 @@ Before execution, show:
 node "$SCRIPT" --batch-inline "<p1>" "<p2>" "<p3>"
 node "$SCRIPT" --batch <prompts.json>
 ```
+
+The script numbers batch outputs (`#1`, `#2`, ...) and includes the same index
+in generated filenames so users can map each result back to the confirmed
+prompt order without exposing every prompt in logs.
 
 ## Branch E: Help
 
@@ -310,7 +357,8 @@ Also support `response.data[].url`.
 ## Parameter rules
 
 - Model: default `gpt-image-2`.
-- Quality: send `quality: "high"` to the upstream API by default.
+- `--quality` is a backward-compatible name for the local 1K/2K/4K resolution
+  preset; send upstream `quality: "high"` by default.
 - Ratio is converted to `size`; do not send `ratio` upstream.
 - Explicit user parameters override saved config.
 - Saved quick mode and batch mode are independent.
@@ -326,10 +374,25 @@ Also support `response.data[].url`.
 | 2K | 2048x2048 | 2048x1152 | 1152x2048 |
 | 4K | 2880x2880 | 3840x2160 | 2160x3840 |
 
+## Runtime and security rules
+
+- Requires Node.js 18.17 or newer (Node 20+ recommended).
+- Prefer `SUBKKAI_IMAGE_GEN_API_KEY` for ephemeral or CI use; otherwise use
+  the local config created by `--set-key-stdin`.
+- Remote API bases must use HTTPS. HTTP is only acceptable for localhost
+  development or when the user explicitly passes `--allow-insecure-api-base`.
+- The script retries transient polling and download errors, but does not
+  blindly retry task-creation POST requests because that could create duplicate
+  paid tasks without an upstream idempotency key.
+- Do not paste full upstream responses into chat. The script redacts
+  credentials, signed URL query strings, and large payloads.
+
 ## Error handling
 
 - `prompt_unsafe`: tell the user the prompt was rejected by upstream moderation and suggest a safer rewrite.
 - `bad_size`: retry only if a clear closest supported size exists; otherwise report supported sizes.
-- `No available compatible accounts`: wait 30 seconds and retry once, then report upstream capacity issue.
+- `No available compatible accounts`: explain the capacity issue, wait 30
+  seconds, and retry the user operation once only when the user has not started
+  another batch; do not blindly replay a task-creation request in parallel.
 - Task timeout: report timeout and offer retry.
 - Missing key: route to Branch A.

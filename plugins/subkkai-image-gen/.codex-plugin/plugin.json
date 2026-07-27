@@ -1,6 +1,6 @@
 {
     "name":  "subkkai-image-gen",
-    "version":  "0.1.0+codex.local-20260701103048",
+    "version":  "0.1.1",
     "description":  "Generate and edit images through Subkkai task-mode gpt-image-2 APIs with local config, polling, batch mode, and saved PNG outputs.",
     "author":  {
                    "name":  "DonsDong"
@@ -13,10 +13,12 @@
                       "developerName":  "DonsDong",
                       "category":  "Productivity",
                       "capabilities":  [
-                                           "Write"
+                                           "Generate images",
+                                           "Edit images",
+                                           "Save image files"
                                        ],
                       "composerIcon":  "./assets/logo.png",
                       "logo":  "./assets/logo.png",
-                      "defaultPrompt":  "我想生成一些图片"
+                      "defaultPrompt":  "Use $subkkai-image-gen to generate or edit images."
                   }
 }

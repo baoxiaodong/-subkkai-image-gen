@@ -1,17 +1,34 @@
 #!/usr/bin/env node
 
-import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_API_BASE = "https://subkkai.com";
 const MODEL = "gpt-image-2";
-const CONFIG_PATH = join(homedir(), ".codex", "subkkai-image-gen-config.json");
-const DEFAULT_OUTPUT_DIR = join(homedir(), "Pictures", "subkkai-image-gen");
 const TASK_TIMEOUT_MS = 300_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const INITIAL_POLL_MS = 700;
 const MAX_POLL_MS = 8_000;
+const MAX_PROMPT_LENGTH = 8_000;
+const MAX_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_JSON_BYTES = 100 * 1024 * 1024;
+const MAX_BATCH_FILE_BYTES = 1024 * 1024;
+const MAX_ERROR_LENGTH = 1_200;
+const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
 const SIZE_MATRIX = {
   "1K": { square: "1024x1024", landscape: "1536x1024", portrait: "1024x1536" },
@@ -22,51 +39,240 @@ const SIZE_MATRIX = {
 const DEFAULTS = { quality: "2K", ratio: "portrait", count: 1, concurrency: 3 };
 const QUALITY_EMOJI = { "1K": "🚀", "2K": "✨", "4K": "💎" };
 const RATIO_NAMES = { square: "正方形", landscape: "横版", portrait: "竖版" };
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-function normalizeBaseUrl(url) {
-  return (url || DEFAULT_API_BASE).replace(/\/+$/, "");
+class AppError extends Error {
+  constructor(code, message, options = {}) {
+    super(message);
+    this.name = "AppError";
+    this.code = code;
+    this.status = options.status;
+    if (options.cause) this.cause = options.cause;
+  }
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function getCodexHome() {
+  return process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
 }
 
-function loadConfig() {
-  if (!existsSync(CONFIG_PATH)) return null;
+function getConfigPath() {
+  return process.env.SUBKKAI_IMAGE_GEN_CONFIG?.trim() || join(getCodexHome(), "subkkai-image-gen-config.json");
+}
+
+function getDefaultOutputDir() {
+  return process.env.SUBKKAI_IMAGE_GEN_OUTPUT_DIR?.trim() || join(homedir(), "Pictures", "subkkai-image-gen");
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isLocalHostname(hostname) {
+  return LOCAL_HOSTNAMES.has(hostname.toLowerCase());
+}
+
+function normalizeBaseUrl(value, { allowInsecure = false } = {}) {
+  const raw = String(value ?? DEFAULT_API_BASE).trim();
+  if (!raw) throw new AppError("INVALID_API_BASE", "API Base 不能为空。");
+
+  let parsed;
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+    parsed = new URL(raw);
+  } catch (error) {
+    throw new AppError("INVALID_API_BASE", "API Base 必须是有效的 http(s) URL。", { cause: error });
+  }
+
+  if (!/^https?:$/.test(parsed.protocol)) {
+    throw new AppError("INVALID_API_BASE", "API Base 只支持 http:// 或 https://。" );
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new AppError("INVALID_API_BASE", "API Base 不得包含用户名、密码、query 或 fragment。" );
+  }
+  if (parsed.protocol === "http:" && !isLocalHostname(parsed.hostname) && !allowInsecure && process.env.SUBKKAI_IMAGE_GEN_ALLOW_INSECURE !== "1") {
+    throw new AppError("INSECURE_API_BASE", "远程 API Base 必须使用 HTTPS；仅允许 localhost 使用 HTTP。" );
+  }
+
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  return parsed.toString().replace(/\/+$/, "");
+}
+
+function normalizeApiKey(value) {
+  if (typeof value !== "string") throw new AppError("INVALID_API_KEY", "API Key 必须是字符串。" );
+  const key = value.trim();
+  if (!key) throw new AppError("INVALID_API_KEY", "API Key 不能为空。" );
+  if (/\s/.test(key)) throw new AppError("INVALID_API_KEY", "API Key 不得包含空白字符。" );
+  if (key.length > 4_096) throw new AppError("INVALID_API_KEY", "API Key 长度超过限制。" );
+  return key;
+}
+
+function configuredApiKey(config) {
+  const environmentKey = process.env.SUBKKAI_IMAGE_GEN_API_KEY?.trim();
+  return environmentKey ? normalizeApiKey(environmentKey) : config.apiKey || null;
+}
+
+function sanitizeText(value, secrets = []) {
+  let safe = String(value ?? "");
+  for (const secret of secrets) {
+    if (secret) safe = safe.split(String(secret)).join("[REDACTED]");
+  }
+  safe = safe
+    .replace(/Bearer\s+[^\s]+/gi, "Bearer [REDACTED]")
+    .replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=_-]+/gi, "[IMAGE_REDACTED]")
+    .replace(/([?&](?:token|key|signature|sig)=)[^&\s]+/gi, "$1[REDACTED]")
+    .replace(/([\"']?(?:api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|secret)[\"']?\s*[:=]\s*[\"']?)[^\"',\s}]+/gi, "$1[REDACTED]");
+  if (safe.length > MAX_ERROR_LENGTH) safe = `${safe.slice(0, MAX_ERROR_LENGTH)}…`;
+  return safe;
+}
+
+function safeUrlForLog(value) {
+  try {
+    const parsed = new URL(String(value));
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
   } catch {
-    return null;
+    return "[invalid-url]";
   }
 }
 
-function saveConfig(config) {
-  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+function validatePrompt(value, label = "Prompt") {
+  if (typeof value !== "string") throw new AppError("INVALID_PROMPT", `${label} 必须是字符串。` );
+  const prompt = value.trim();
+  if (!prompt) throw new AppError("INVALID_PROMPT", `${label} 不能为空。` );
+  if (prompt.length > MAX_PROMPT_LENGTH) throw new AppError("INVALID_PROMPT", `${label} 不能超过 ${MAX_PROMPT_LENGTH} 个字符。` );
+  return value;
 }
 
-function getApiKey() {
-  const config = loadConfig();
-  if (!config?.apiKey) {
-    console.error("ERROR: API key not configured. Run --set-key <key> first.");
-    process.exit(1);
+function validatePrompts(prompts, { max = 20 } = {}) {
+  if (!Array.isArray(prompts) || !prompts.length) {
+    throw new AppError("INVALID_PROMPTS", "Prompt 列表不能为空。" );
   }
-  return config.apiKey;
+  if (prompts.length > max) throw new AppError("INVALID_PROMPTS", `最多支持 ${max} 个 prompt。` );
+  prompts.forEach((prompt, index) => validatePrompt(prompt, `Prompt #${index + 1}`));
+  return prompts;
 }
 
-function keyPreview(key) {
-  if (!key) return null;
-  if (key.length <= 12) return `${key.slice(0, 3)}...${key.slice(-2)}`;
-  return `${key.slice(0, 8)}...${key.slice(-4)}`;
+function parseInteger(value, label, min, max) {
+  const parsed = typeof value === "number" ? value : Number(String(value));
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new AppError("INVALID_ARGUMENT", `${label} 必须是 ${min}~${max} 的整数。` );
+  }
+  return parsed;
 }
 
 function resolveSize(quality, ratio) {
   return SIZE_MATRIX[quality?.toUpperCase()]?.[ratio?.toLowerCase()] || null;
 }
 
+function normalizeQuickMode(mode = {}) {
+  if (!isPlainObject(mode)) throw new AppError("INVALID_CONFIG", "quickMode 配置必须是对象。" );
+  const quality = String(mode.quality ?? DEFAULTS.quality).toUpperCase();
+  const ratio = String(mode.ratio ?? DEFAULTS.ratio).toLowerCase();
+  const count = parseInteger(mode.count ?? DEFAULTS.count, "快速模式数量", 1, 4);
+  if (!resolveSize(quality, ratio)) throw new AppError("INVALID_CONFIG", `不支持的画质或比例: ${quality}/${ratio}。` );
+  return { quality, ratio, count };
+}
+
+function normalizeBatchMode(mode = {}) {
+  if (!isPlainObject(mode)) throw new AppError("INVALID_CONFIG", "batchMode 配置必须是对象。" );
+  const quality = String(mode.quality ?? DEFAULTS.quality).toUpperCase();
+  const ratio = String(mode.ratio ?? DEFAULTS.ratio).toLowerCase();
+  const concurrency = parseInteger(mode.concurrency ?? DEFAULTS.concurrency, "批量并发数", 1, 10);
+  if (!resolveSize(quality, ratio)) throw new AppError("INVALID_CONFIG", `不支持的画质或比例: ${quality}/${ratio}。` );
+  return { quality, ratio, concurrency };
+}
+
+function validateConfig(input) {
+  if (!isPlainObject(input)) throw new AppError("INVALID_CONFIG", "配置文件根节点必须是对象。" );
+  const config = { ...input };
+  if (config.apiKey !== undefined) config.apiKey = normalizeApiKey(config.apiKey);
+  if (config.allowInsecureApiBase !== undefined && typeof config.allowInsecureApiBase !== "boolean") {
+    throw new AppError("INVALID_CONFIG", "allowInsecureApiBase 必须是布尔值。" );
+  }
+  if (config.apiBase !== undefined) {
+    config.apiBase = normalizeBaseUrl(config.apiBase, { allowInsecure: config.allowInsecureApiBase === true });
+  }
+  if (config.quickMode !== undefined) config.quickMode = normalizeQuickMode(config.quickMode);
+  if (config.batchMode !== undefined) config.batchMode = normalizeBatchMode(config.batchMode);
+  return config;
+}
+
+function loadConfig() {
+  const configPath = getConfigPath();
+  if (!existsSync(configPath)) return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(configPath, "utf8"));
+  } catch (error) {
+    throw new AppError("CONFIG_INVALID", `配置文件损坏，请修复或删除：${configPath}`, { cause: error });
+  }
+  return validateConfig(parsed);
+}
+
+function setPrivateFileMode(filePath) {
+  if (process.platform !== "win32") chmodSync(filePath, 0o600);
+}
+
+function replaceFileAtomically(tempPath, targetPath) {
+  try {
+    renameSync(tempPath, targetPath);
+    return;
+  } catch (error) {
+    if (process.platform !== "win32" || !existsSync(targetPath)) throw error;
+  }
+
+  const backupPath = `${targetPath}.bak`;
+  copyFileSync(targetPath, backupPath);
+  setPrivateFileMode(backupPath);
+  unlinkSync(targetPath);
+  try {
+    renameSync(tempPath, targetPath);
+  } catch (error) {
+    copyFileSync(backupPath, targetPath);
+    setPrivateFileMode(targetPath);
+    throw error;
+  }
+}
+
+function saveConfig(config) {
+  const normalized = validateConfig(config);
+  const configPath = getConfigPath();
+  const configDir = dirname(configPath);
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  const tempPath = `${configPath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(tempPath, `${JSON.stringify(normalized, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    setPrivateFileMode(tempPath);
+    replaceFileAtomically(tempPath, configPath);
+    setPrivateFileMode(configPath);
+  } finally {
+    if (existsSync(tempPath)) unlinkSync(tempPath);
+  }
+}
+
+function keyPreview(key) {
+  if (!key) return null;
+  const value = String(key);
+  if (value.length <= 12) return `${value.slice(0, 3)}...${value.slice(-2)}`;
+  return `${value.slice(0, 8)}...${value.slice(-4)}`;
+}
+
+function getApiKey(config) {
+  const key = configuredApiKey(config);
+  if (!key) throw new AppError("MISSING_API_KEY", "未配置 API Key。请使用环境变量或 --set-key-stdin。" );
+  return key;
+}
+
 function resolveOutputDir(userDir) {
-  const outputDir = userDir || DEFAULT_OUTPUT_DIR;
+  const outputDir = resolvePath(userDir || getDefaultOutputDir());
   mkdirSync(outputDir, { recursive: true });
+  if (!statSync(outputDir).isDirectory()) throw new AppError("INVALID_OUTPUT_DIR", `输出路径不是目录：${outputDir}` );
   return outputDir;
 }
 
@@ -83,57 +289,221 @@ function timestamp() {
   ].join("");
 }
 
-async function readError(response) {
-  const body = await response.text();
+function retryDelayMs(attempt, retryAfterMs) {
+  const configuredBase = Number(process.env.SUBKKAI_IMAGE_GEN_RETRY_BASE_MS || 400);
+  const base = Number.isFinite(configuredBase) && configuredBase >= 0 ? configuredBase : 400;
+  const exponential = Math.min(8_000, base * 2 ** attempt);
+  const serverDelay = Number.isFinite(retryAfterMs) ? Math.min(30_000, Math.max(0, retryAfterMs)) : null;
+  if (serverDelay !== null) return serverDelay;
+  if (process.env.SUBKKAI_IMAGE_GEN_NO_JITTER === "1") return exponential;
+  return Math.round(exponential * (0.8 + Math.random() * 0.4));
+}
+
+function parseRetryAfter(response) {
+  const value = response.headers.get("retry-after");
+  if (!value) return null;
+  if (/^\d+(?:\.\d+)?$/.test(value.trim())) return Number(value) * 1_000;
+  const timestampValue = Date.parse(value);
+  return Number.isFinite(timestampValue) ? Math.max(0, timestampValue - Date.now()) : null;
+}
+
+async function sleep(ms) {
+  if (ms <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new AppError("NETWORK_TIMEOUT", `请求超时（${Math.round(timeoutMs / 1_000)} 秒）。`, { cause: error });
+    }
+    throw new AppError("NETWORK_ERROR", `网络请求失败：${sanitizeText(error?.message || error)}`, { cause: error });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readResponseBytes(response, maxBytes) {
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new AppError("RESPONSE_TOO_LARGE", `响应超过 ${Math.round(maxBytes / 1024 / 1024)}MB 限制。` );
+  }
+
+  if (!response.body) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > maxBytes) throw new AppError("RESPONSE_TOO_LARGE", "响应超过大小限制。" );
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new AppError("RESPONSE_TOO_LARGE", "响应超过大小限制。" );
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function errorMessageFromBody(body, apiKey) {
   try {
     const parsed = JSON.parse(body);
-    return parsed.error?.message || parsed.message || parsed.error || body;
+    const errorValue = parsed?.error;
+    const errorCode = typeof errorValue === "object" ? errorValue?.code : parsed?.code;
+    const errorMessage = typeof errorValue === "string"
+      ? errorValue
+      : errorValue?.message || parsed?.message || parsed?.detail || body;
+    const detail = errorCode ? `${errorCode}: ${errorMessage}` : errorMessage;
+    return sanitizeText(detail, [apiKey]);
   } catch {
-    return body;
+    return sanitizeText(body, [apiKey]);
+  }
+}
+
+async function requestJson(url, options = {}, {
+  apiKey = "",
+  retries = 0,
+  retryable = false,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  deadline = null,
+} = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const canRetry = retryable || method === "GET" || method === "HEAD";
+  let attempt = 0;
+
+  while (true) {
+    const remaining = deadline === null ? timeoutMs : deadline - Date.now();
+    if (remaining <= 0) throw new AppError("NETWORK_TIMEOUT", "请求超过了任务总时限。" );
+    let response;
+    try {
+      response = await fetchWithTimeout(url, options, Math.min(timeoutMs, remaining));
+    } catch (error) {
+      if (canRetry && attempt < retries) {
+        const waitMs = retryDelayMs(attempt);
+        if (deadline !== null && Date.now() + waitMs >= deadline) throw error;
+        await sleep(waitMs);
+        attempt += 1;
+        continue;
+      }
+      throw error;
+    }
+
+    const body = (await readResponseBytes(response, MAX_JSON_BYTES)).toString("utf8");
+    if (!response.ok) {
+      if (canRetry && attempt < retries && RETRYABLE_STATUSES.has(response.status)) {
+        const waitMs = retryDelayMs(attempt, parseRetryAfter(response));
+        if (deadline !== null && Date.now() + waitMs >= deadline) {
+          throw new AppError("HTTP_ERROR", `HTTP ${response.status}: ${errorMessageFromBody(body, apiKey)}`, { status: response.status });
+        }
+        await sleep(waitMs);
+        attempt += 1;
+        continue;
+      }
+      throw new AppError("HTTP_ERROR", `HTTP ${response.status}: ${errorMessageFromBody(body, apiKey)}`, { status: response.status });
+    }
+    if (!body.trim()) throw new AppError("EMPTY_RESPONSE", `HTTP ${response.status}: 响应为空。` );
+    try {
+      return JSON.parse(body);
+    } catch (error) {
+      throw new AppError("INVALID_RESPONSE", `HTTP ${response.status}: 响应不是有效 JSON。`, { cause: error });
+    }
   }
 }
 
 function extractTaskId(payload) {
-  return payload?.id || payload?.task_id || payload?.taskId || payload?.data?.id || payload?.data?.task_id;
+  const candidates = [
+    payload?.id,
+    payload?.task_id,
+    payload?.taskId,
+    payload?.data?.id,
+    payload?.data?.task_id,
+    payload?.data?.taskId,
+    payload?.data?.task?.id,
+  ];
+  const taskId = candidates.find((value) => typeof value === "string" && value.trim());
+  return taskId?.trim() || null;
 }
 
-async function requestJson(url, options) {
-  const response = await fetch(url, options);
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${await readError(response)}`);
-  }
-  return response.json();
-}
-
-async function createGenerationTask({ apiBase, apiKey, prompt, size, n }) {
+async function createGenerationTask({ apiBase, apiKey, prompt, size, n = 1 }) {
+  validatePrompt(prompt);
   const payload = {
     model: MODEL,
     prompt,
     size,
-    n,
+    n: parseInteger(n, "生成数量", 1, 4),
     quality: "high",
     moderation: "auto",
     output_format: "png",
     stream: false,
   };
-
   const result = await requestJson(`${apiBase}/v1/image-tasks/generations`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    cache: "no-store",
     body: JSON.stringify(payload),
-  });
-
+  }, { apiKey });
   const taskId = extractTaskId(result);
-  if (!taskId) throw new Error(`No task id in generation response: ${JSON.stringify(result)}`);
+  if (!taskId) throw new AppError("INVALID_RESPONSE", "生成接口未返回任务 ID。" );
   return taskId;
 }
 
-async function createEditTask({ apiBase, apiKey, imagePath, prompt, size }) {
-  if (!existsSync(imagePath)) throw new Error(`Image file does not exist: ${imagePath}`);
+function guessMimeType(filePath) {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".png")) return "image/png";
+  return null;
+}
 
+function detectMimeType(buffer) {
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(PNG_SIGNATURE)) return "image/png";
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xd8) return "image/jpeg";
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  return null;
+}
+
+function validateImageBuffer(buffer, label = "图片") {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) throw new AppError("INVALID_IMAGE", `${label} 为空。` );
+  if (buffer.length > MAX_IMAGE_BYTES) throw new AppError("IMAGE_TOO_LARGE", `${label} 超过 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB 限制。` );
+  const mimeType = detectMimeType(buffer);
+  if (!mimeType) throw new AppError("INVALID_IMAGE", `${label} 不是支持的 PNG/JPEG/WebP 文件。` );
+  return mimeType;
+}
+
+function readImageFile(imagePath) {
+  if (!existsSync(imagePath)) throw new AppError("IMAGE_NOT_FOUND", `图片文件不存在：${imagePath}` );
+  const info = statSync(imagePath);
+  if (!info.isFile()) throw new AppError("INVALID_IMAGE", `图片路径不是文件：${imagePath}` );
+  if (info.size > MAX_IMAGE_BYTES) throw new AppError("IMAGE_TOO_LARGE", `图片超过 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB 限制。` );
+  const expectedMime = guessMimeType(imagePath);
+  if (!expectedMime) throw new AppError("INVALID_IMAGE", "仅支持 .png、.jpg、.jpeg 和 .webp 图片。" );
+  const buffer = readFileSync(imagePath);
+  const actualMime = validateImageBuffer(buffer, "输入图片");
+  if (actualMime !== expectedMime) {
+    throw new AppError("INVALID_IMAGE", `图片扩展名与实际格式不一致：${imagePath}` );
+  }
+  return { buffer, mimeType: actualMime };
+}
+
+async function createEditTask({ apiBase, apiKey, imagePath, prompt, size }) {
+  validatePrompt(prompt);
+  const { buffer: imageBuffer, mimeType } = readImageFile(imagePath);
   const form = new FormData();
-  const imageBuffer = readFileSync(imagePath);
-  const imageBlob = new Blob([imageBuffer], { type: guessMimeType(imagePath) });
+  const imageBlob = new Blob([imageBuffer], { type: mimeType });
   form.append("model", MODEL);
   form.append("prompt", prompt);
   form.append("n", "1");
@@ -146,162 +516,351 @@ async function createEditTask({ apiBase, apiKey, imagePath, prompt, size }) {
   const result = await requestJson(`${apiBase}/v1/image-tasks/edits`, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}` },
+    cache: "no-store",
     body: form,
-  });
-
+  }, { apiKey });
   const taskId = extractTaskId(result);
-  if (!taskId) throw new Error(`No task id in edit response: ${JSON.stringify(result)}`);
+  if (!taskId) throw new AppError("INVALID_RESPONSE", "编辑接口未返回任务 ID。" );
   return taskId;
 }
 
-function guessMimeType(path) {
-  const lower = path.toLowerCase();
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-  if (lower.endsWith(".webp")) return "image/webp";
-  return "image/png";
+function validateDownloadUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(String(value));
+  } catch (error) {
+    throw new AppError("INVALID_IMAGE_URL", "图片下载地址无效。", { cause: error });
+  }
+  if (!/^https?:$/.test(parsed.protocol)) throw new AppError("INVALID_IMAGE_URL", "图片下载地址只支持 http(s)。" );
+  if (parsed.protocol === "http:" && !isLocalHostname(parsed.hostname) && process.env.SUBKKAI_IMAGE_GEN_ALLOW_INSECURE !== "1") {
+    throw new AppError("INSECURE_IMAGE_URL", "远程图片下载必须使用 HTTPS。" );
+  }
+  if (parsed.username || parsed.password) throw new AppError("INVALID_IMAGE_URL", "图片下载地址不得包含凭据。" );
+  return parsed.toString();
+}
+
+async function fetchImageResponse(value, { retries = 2, maxRedirects = 3 } = {}) {
+  let currentUrl = validateDownloadUrl(value);
+  let attempt = 0;
+  let redirects = 0;
+
+  while (true) {
+    let response;
+    try {
+      response = await fetchWithTimeout(currentUrl, {
+        redirect: "manual",
+        cache: "no-store",
+      }, REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      if (attempt < retries) {
+        await sleep(retryDelayMs(attempt));
+        attempt += 1;
+        continue;
+      }
+      throw error;
+    }
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location) throw new AppError("IMAGE_DOWNLOAD_FAILED", "图片下载重定向缺少 Location。" );
+      if (redirects >= maxRedirects) throw new AppError("IMAGE_DOWNLOAD_FAILED", "图片下载重定向次数过多。" );
+      await response.body?.cancel();
+      currentUrl = validateDownloadUrl(new URL(location, currentUrl).toString());
+      redirects += 1;
+      continue;
+    }
+
+    if (response.ok) return response;
+    if (attempt < retries && RETRYABLE_STATUSES.has(response.status)) {
+      const waitMs = retryDelayMs(attempt, parseRetryAfter(response));
+      await response.body?.cancel();
+      await sleep(waitMs);
+      attempt += 1;
+      continue;
+    }
+
+    await response.body?.cancel();
+    throw new AppError("IMAGE_DOWNLOAD_FAILED", `图片下载失败 HTTP ${response.status}。`, { status: response.status });
+  }
+}
+
+function extensionForMimeType(mimeType) {
+  if (mimeType === "image/jpeg") return ".jpg";
+  if (mimeType === "image/webp") return ".webp";
+  return ".png";
+}
+
+function createOutputPath(outputDir, prefix, extension) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const candidate = join(outputDir, `${prefix}_${timestamp()}_${randomUUID()}${extension}`);
+    if (!existsSync(candidate)) return candidate;
+  }
+  throw new AppError("OUTPUT_COLLISION", "无法创建唯一的输出文件名。" );
+}
+
+function writeBufferAtomically(filePath, buffer) {
+  const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(tempPath, buffer, { flag: "wx" });
+    renameSync(tempPath, filePath);
+  } finally {
+    if (existsSync(tempPath)) unlinkSync(tempPath);
+  }
+}
+
+async function saveImageItem(item, outputDir, prefix) {
+  let buffer;
+  if (typeof item?.b64_json === "string" || typeof item?.base64 === "string") {
+    const encoded = String(item.b64_json || item.base64).replace(/\s+/g, "");
+    if (!encoded || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(encoded)) throw new AppError("INVALID_IMAGE", "图片 base64 数据无效。" );
+    buffer = Buffer.from(encoded, encoded.includes("-") || encoded.includes("_") ? "base64url" : "base64");
+  } else if (item?.url) {
+    const response = await fetchImageResponse(item.url);
+    buffer = await readResponseBytes(response, MAX_IMAGE_BYTES);
+  } else {
+    throw new AppError("INVALID_IMAGE_RESPONSE", "图片结果缺少 b64_json、base64 或 url。" );
+  }
+
+  const mimeType = validateImageBuffer(buffer, "输出图片");
+  const filePath = createOutputPath(outputDir, prefix, extensionForMimeType(mimeType));
+  writeBufferAtomically(filePath, buffer);
+  return { path: filePath, bytes: buffer.length, fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB` };
+}
+
+function extractTaskStatus(task) {
+  return String(
+    task?.status ||
+    task?.data?.status ||
+    task?.data?.task?.status ||
+    task?.task?.status ||
+    "",
+  ).toLowerCase();
+}
+
+function extractTaskError(task, apiKey = "") {
+  const errorValue = task?.error || task?.data?.error;
+  const code = typeof errorValue === "object" ? errorValue?.code : task?.code;
+  const message = typeof errorValue === "string"
+    ? errorValue
+    : errorValue?.message || task?.message || "上游任务失败。";
+  return sanitizeText(code ? `${code}: ${message}` : message, [apiKey]);
 }
 
 async function pollTask({ apiBase, apiKey, taskId }) {
   const startedAt = Date.now();
+  const deadline = startedAt + TASK_TIMEOUT_MS;
   let delay = INITIAL_POLL_MS;
-
-  while (Date.now() - startedAt < TASK_TIMEOUT_MS) {
+  let lastReportedStatus = "";
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
     const task = await requestJson(`${apiBase}/v1/image-tasks/${encodeURIComponent(taskId)}`, {
       method: "GET",
       headers: { Authorization: `Bearer ${apiKey}` },
+      cache: "no-store",
+    }, {
+      apiKey,
+      retries: 3,
+      retryable: true,
+      timeoutMs: Math.min(REQUEST_TIMEOUT_MS, remaining),
+      deadline,
     });
 
-    const status = String(task.status || task.data?.status || "").toLowerCase();
-    if (status === "succeeded" || status === "success" || status === "completed") return task;
-    if (status === "failed" || status === "canceled" || status === "cancelled") {
-      const message = task.error?.message || task.error || task.message || JSON.stringify(task);
-      throw new Error(`Task ${status}: ${message}`);
+    const status = extractTaskStatus(task);
+    lastReportedStatus = reportTaskProgress(status, task, startedAt, lastReportedStatus);
+    if (["succeeded", "success", "completed"].includes(status)) return task;
+    if (["failed", "canceled", "cancelled", "error", "expired", "rejected"].includes(status)) {
+      throw new AppError("TASK_FAILED", `Task ${status}: ${extractTaskError(task, apiKey)}` );
     }
 
-    await sleep(delay);
+    const waitMs = Math.min(delay, Math.max(0, deadline - Date.now()));
+    await sleep(process.env.SUBKKAI_IMAGE_GEN_NO_JITTER === "1" ? waitMs : Math.round(waitMs * (0.8 + Math.random() * 0.4)));
     delay = Math.min(Math.round(delay * 1.45), MAX_POLL_MS);
   }
-
-  throw new Error(`Task timeout after ${Math.round(TASK_TIMEOUT_MS / 1000)}s: ${taskId}`);
+  throw new AppError("TASK_TIMEOUT", `任务超过 ${Math.round(TASK_TIMEOUT_MS / 1_000)} 秒仍未完成：${sanitizeText(taskId)}` );
 }
 
 function extractImageItems(task) {
-  const response = task.response || task.data?.response || task.result || task.data?.result || task;
-  const data = response?.data || response?.images || task.images || [];
-  return Array.isArray(data) ? data : [];
+  const candidates = [
+    task?.response?.data,
+    task?.response?.images,
+    task?.data?.response?.data,
+    task?.data?.response?.images,
+    task?.result?.data,
+    task?.result?.images,
+    task?.data,
+    task?.images,
+  ];
+  return candidates.find(Array.isArray) || [];
 }
 
-async function saveImageItem(item, outputDir, prefix) {
-  const filename = `${prefix}_${timestamp()}_${Math.random().toString(36).slice(2, 6)}.png`;
-  const filepath = join(outputDir, filename);
-
-  if (item.b64_json || item.base64) {
-    const buffer = Buffer.from(item.b64_json || item.base64, "base64");
-    writeFileSync(filepath, buffer);
-    return { path: filepath, fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB` };
-  }
-
-  if (item.url) {
-    const response = await fetch(item.url);
-    if (!response.ok) throw new Error(`Download failed HTTP ${response.status}: ${item.url}`);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    writeFileSync(filepath, buffer);
-    return { path: filepath, fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB` };
-  }
-
-  throw new Error(`No b64_json/base64/url in image item: ${JSON.stringify(item)}`);
+function friendlyErrorMessage(error, secrets = []) {
+  const code = error?.code || "ERROR";
+  const raw = sanitizeText(error?.message || error, secrets);
+  if (/prompt_unsafe/i.test(raw)) return "上游安全策略拒绝了这个 prompt，请改写为更中性的描述。";
+  if (/bad_size/i.test(raw)) return "上游不支持当前尺寸，请改用 1K/2K/4K 与 square/landscape/portrait 的组合。";
+  if (/No available compatible accounts/i.test(raw)) return "上游暂时没有可用生图资源，请等待约 30 秒后重试。";
+  if (code === "TASK_TIMEOUT") return `${raw} 远端任务可能仍在运行，请稍后查询或确认后再重试。`;
+  if (code === "NETWORK_TIMEOUT") return `${raw} 请检查网络或稍后重试。`;
+  if (code === "MISSING_API_KEY") return `${raw} 可使用 SUBKKAI_IMAGE_GEN_API_KEY，或通过 stdin 配置。`;
+  if (code === "INVALID_PROMPT") return `${raw} 请提供非空且不超过 ${MAX_PROMPT_LENGTH} 个字符的描述。`;
+  if (code === "IMAGE_TOO_LARGE") return `${raw} 请压缩图片后再编辑。`;
+  return raw;
 }
 
-async function runGeneration({ apiBase, apiKey, prompt, size, outputDir }) {
-  const start = Date.now();
+const TASK_STATUS_LABELS = {
+  queued: "排队中",
+  pending: "等待资源",
+  processing: "生成中",
+  running: "生成中",
+  in_progress: "生成中",
+};
+
+function reportTaskProgress(status, task, startedAt, previousStatus) {
+  if (!status || status === previousStatus || ["succeeded", "success", "completed"].includes(status)) return previousStatus;
+  const progressValue = task?.progress ?? task?.data?.progress ?? task?.data?.task?.progress;
+  const progress = Number(progressValue);
+  const label = TASK_STATUS_LABELS[status] || "处理中";
+  const suffix = Number.isFinite(progress) && progress >= 0 && progress <= 100 ? ` ${Math.round(progress)}%` : "";
+  console.log(`⏳ 任务状态：${label}${suffix}（已用 ${Math.round((Date.now() - startedAt) / 1_000)}s）`);
+  return status;
+}
+
+async function runGeneration({ apiBase, apiKey, prompt, size, outputDir, prefix = "img" }) {
+  const startedAt = Date.now();
   const taskId = await createGenerationTask({ apiBase, apiKey, prompt, size, n: 1 });
   console.log(`🆔 任务: ${taskId}`);
   const task = await pollTask({ apiBase, apiKey, taskId });
   const items = extractImageItems(task);
-  if (!items.length) throw new Error(`No image data in task result: ${JSON.stringify(task)}`);
+  if (!items.length) throw new AppError("INVALID_IMAGE_RESPONSE", "生成任务完成，但响应中没有图片数据。" );
   const saved = [];
-  for (const item of items) saved.push(await saveImageItem(item, outputDir, "img"));
-  return { elapsed: Date.now() - start, taskId, saved };
+  for (const item of items) saved.push(await saveImageItem(item, outputDir, prefix));
+  return { elapsed: Date.now() - startedAt, taskId, saved };
 }
 
 async function runEdit({ apiBase, apiKey, imagePath, prompt, size, outputDir }) {
-  const start = Date.now();
+  const startedAt = Date.now();
   const taskId = await createEditTask({ apiBase, apiKey, imagePath, prompt, size });
   console.log(`🆔 任务: ${taskId}`);
   const task = await pollTask({ apiBase, apiKey, taskId });
   const items = extractImageItems(task);
-  if (!items.length) throw new Error(`No image data in edit result: ${JSON.stringify(task)}`);
+  if (!items.length) throw new AppError("INVALID_IMAGE_RESPONSE", "编辑任务完成，但响应中没有图片数据。" );
   const saved = [];
   for (const item of items) saved.push(await saveImageItem(item, outputDir, "edit"));
-  return { elapsed: Date.now() - start, taskId, saved };
+  return { elapsed: Date.now() - startedAt, taskId, saved };
+}
+
+function promptPreview(prompt) {
+  if (process.env.SUBKKAI_IMAGE_GEN_VERBOSE === "1") return `: "${sanitizeText(prompt).slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`;
+  return "";
 }
 
 async function runBatch({ apiBase, apiKey, prompts, size, concurrency, outputDir }) {
-  if (prompts.length > 20) throw new Error("Maximum batch size is 20 prompts.");
+  validatePrompts(prompts);
+  const workerCount = Math.max(1, Math.min(parseInteger(concurrency, "并发数", 1, 10), prompts.length));
   const results = new Array(prompts.length);
   let nextIndex = 0;
-  const startedAt = Date.now();
 
   async function worker() {
     while (nextIndex < prompts.length) {
       const index = nextIndex++;
       const prompt = prompts[index];
-      console.log(`[${index + 1}/${prompts.length}] 生成中: "${prompt.slice(0, 30)}${prompt.length > 30 ? "..." : ""}"`);
+      console.log(`[${index + 1}/${prompts.length}] 生成中${promptPreview(prompt)}`);
       try {
-        const result = await runGeneration({ apiBase, apiKey, prompt, size, outputDir });
+        const result = await runGeneration({ apiBase, apiKey, prompt, size, outputDir, prefix: `img_${String(index + 1).padStart(2, "0")}` });
         results[index] = { prompt, ok: true, ...result };
-        console.log(`✅ [${index + 1}/${prompts.length}] ${(result.elapsed / 1000).toFixed(1)}s`);
+        console.log(`✅ [${index + 1}/${prompts.length}] ${(result.elapsed / 1_000).toFixed(1)}s`);
       } catch (error) {
-        results[index] = { prompt, ok: false, error: error.message };
-        console.log(`❌ [${index + 1}/${prompts.length}] ${error.message}`);
+        results[index] = { prompt, ok: false, error: friendlyErrorMessage(error, [apiKey]) };
+        console.log(`❌ [${index + 1}/${prompts.length}] ${results[index].error}`);
       }
     }
   }
 
-  await Promise.all(Array.from({ length: Math.min(concurrency, prompts.length) }, () => worker()));
-  const elapsed = Date.now() - startedAt;
-  const ok = results.filter((result) => result.ok);
-
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  const okCount = results.filter((result) => result?.ok).length;
   console.log();
-  for (const result of results) {
+  for (const [index, result] of results.entries()) {
     if (result.ok) {
-      console.log(`🎨 "${result.prompt}" ✅`);
+      console.log(`🎨 #${index + 1} ✅`);
       for (const file of result.saved) console.log(`📁 ${file.path} ｜ ${file.fileSize}`);
     } else {
-      console.log(`🎨 "${result.prompt}" ❌ ${result.error}`);
+      console.log(`🎨 #${index + 1} ❌ ${result.error}`);
     }
     console.log();
   }
-  console.log(`✅ ${ok.length}/${results.length} ｜ ${(elapsed / 1000).toFixed(1)}s`);
+  console.log(`✅ ${okCount}/${results.length}`);
   console.log(`📍 ${outputDir}`);
-  return ok.length === results.length ? 0 : 1;
+  return okCount === results.length ? 0 : 1;
+}
+
+function requireValue(argv, index, flag) {
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("--")) throw new AppError("INVALID_ARGUMENT", `${flag} 缺少参数。` );
+  return value;
 }
 
 function parseArgs(argv) {
   const args = { prompts: [], flags: {} };
-  for (let index = 0; index < argv.length; index++) {
+  for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--get-config") args.flags.getConfig = true;
-    else if (arg === "--set-key" && argv[index + 1]) args.flags.setKey = argv[++index];
-    else if (arg === "--set-api-base" && argv[index + 1]) args.flags.setApiBase = argv[++index];
+    else if (arg === "--set-key") {
+      args.flags.setKey = requireValue(argv, index, arg);
+      index += 1;
+    }
+    else if (arg === "--set-key-stdin") args.flags.setKeyStdin = true;
+    else if (arg === "--set-api-base") {
+      args.flags.setApiBase = requireValue(argv, index, arg);
+      index += 1;
+    }
+    else if (arg === "--allow-insecure-api-base") args.flags.allowInsecureApiBase = true;
     else if (arg === "--set-quick-mode") args.flags.setQuickMode = true;
     else if (arg === "--set-batch-mode") args.flags.setBatchMode = true;
-    else if (arg === "--prompt" && argv[index + 1]) args.prompts.push(argv[++index]);
-    else if (arg === "--quality" && argv[index + 1]) args.flags.quality = argv[++index];
-    else if (arg === "--ratio" && argv[index + 1]) args.flags.ratio = argv[++index];
-    else if (arg === "--count" && argv[index + 1]) args.flags.count = Number.parseInt(argv[++index], 10);
-    else if (arg === "--concurrency" && argv[index + 1]) args.flags.concurrency = Number.parseInt(argv[++index], 10);
-    else if (arg === "--output-dir" && argv[index + 1]) args.flags.outputDir = argv[++index];
-    else if (arg === "--batch" && argv[index + 1]) args.flags.batchFile = argv[++index];
+    else if (arg === "--prompt") {
+      args.prompts.push(requireValue(argv, index, arg));
+      index += 1;
+    }
+    else if (arg === "--quality") {
+      args.flags.quality = requireValue(argv, index, arg);
+      index += 1;
+    }
+    else if (arg === "--ratio") {
+      args.flags.ratio = requireValue(argv, index, arg);
+      index += 1;
+    }
+    else if (arg === "--count") {
+      args.flags.count = requireValue(argv, index, arg);
+      index += 1;
+    }
+    else if (arg === "--concurrency") {
+      args.flags.concurrency = requireValue(argv, index, arg);
+      index += 1;
+    }
+    else if (arg === "--output-dir") {
+      args.flags.outputDir = requireValue(argv, index, arg);
+      index += 1;
+    }
+    else if (arg === "--batch") {
+      args.flags.batchFile = requireValue(argv, index, arg);
+      index += 1;
+    }
     else if (arg === "--batch-inline") {
       args.flags.batchInline = true;
-      index++;
-      while (index < argv.length && !argv[index].startsWith("--")) args.prompts.push(argv[index++]);
-      index--;
+      let added = 0;
+      while (index + 1 < argv.length && !argv[index + 1].startsWith("--")) {
+        args.prompts.push(argv[++index]);
+        added += 1;
+      }
+      if (!added) throw new AppError("INVALID_ARGUMENT", "--batch-inline 至少需要一个 prompt。" );
+    } else if (arg === "--edit") args.flags.edit = true;
+    else if (arg === "--image") {
+      args.flags.image = requireValue(argv, index, arg);
+      index += 1;
     }
-    else if (arg === "--edit") args.flags.edit = true;
-    else if (arg === "--image" && argv[index + 1]) args.flags.image = argv[++index];
+    else if (arg === "--verbose") args.flags.verbose = true;
     else if (arg === "--help" || arg === "-h") args.flags.help = true;
+    else if (arg.startsWith("--")) throw new AppError("INVALID_ARGUMENT", `未知参数：${arg}` );
+    else throw new AppError("INVALID_ARGUMENT", `无法识别的参数：${arg}` );
   }
   return args;
 }
@@ -311,8 +870,9 @@ function printUsage() {
 
 CONFIG:
   --get-config
-  --set-key <key>
-  --set-api-base <url>
+  --set-key-stdin                 从 stdin 安全读取 API Key
+  --set-key <key>                 兼容旧用法，不建议用于共享终端
+  --set-api-base <url> [--allow-insecure-api-base]
   --set-quick-mode --quality Q --ratio R --count N
   --set-batch-mode --quality Q --ratio R --concurrency N
 
@@ -320,6 +880,7 @@ GENERATE:
   --prompt "..." [--quality Q] [--ratio R] [--count N] [--output-dir D]
   --batch <file.json> [--quality Q] [--ratio R] [--concurrency N]
   --batch-inline "p1" "p2" [--quality Q] [--ratio R] [--concurrency N]
+  --verbose                         显示截断后的 prompt 预览
 
 EDIT:
   --edit --image <path> --prompt "..." [--quality Q] [--ratio R]
@@ -327,122 +888,265 @@ EDIT:
 }
 
 function resolveModeParams(flags, mode) {
-  const quality = (flags.quality || mode?.quality || DEFAULTS.quality).toUpperCase();
-  const ratio = (flags.ratio || mode?.ratio || DEFAULTS.ratio).toLowerCase();
+  const quality = String(flags.quality ?? mode?.quality ?? DEFAULTS.quality).toUpperCase();
+  const ratio = String(flags.ratio ?? mode?.ratio ?? DEFAULTS.ratio).toLowerCase();
   const size = resolveSize(quality, ratio);
-  if (!size) throw new Error(`Invalid quality="${quality}" or ratio="${ratio}".`);
+  if (!size) throw new AppError("INVALID_ARGUMENT", `不支持的画质或比例：${quality}/${ratio}。` );
   return { quality, ratio, size };
 }
 
-async function main() {
-  const { prompts, flags } = parseArgs(process.argv.slice(2));
-  const config = loadConfig() || {};
-  const apiBase = normalizeBaseUrl(config.apiBase || DEFAULT_API_BASE);
+async function readKeyFromStdin() {
+  if (!process.stdin.isTTY) return normalizeApiKey(readFileSync(0, "utf8"));
+  if (typeof process.stdin.setRawMode !== "function") {
+    throw new AppError("INVALID_ARGUMENT", "当前终端不支持隐藏输入，请通过非 TTY stdin 管道传入 Key。" );
+  }
+
+  process.stdout.write("🔑 API Key（输入内容不会显示）: ");
+  return new Promise((resolve, reject) => {
+    let value = "";
+    const stdin = process.stdin;
+
+    function cleanup() {
+      stdin.off("data", onData);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write("\n");
+    }
+
+    function finish() {
+      cleanup();
+      try {
+        resolve(normalizeApiKey(value));
+      } catch (error) {
+        reject(error);
+      }
+    }
+
+    function onData(chunk) {
+      for (const char of String(chunk)) {
+        if (char === "\r" || char === "\n" || char === "\u0004") {
+          finish();
+          return;
+        }
+        if (char === "\u0003") {
+          cleanup();
+          reject(new AppError("CANCELLED", "已取消 API Key 输入。" ));
+          return;
+        }
+        if (char === "\u007f" || char === "\b") {
+          value = value.slice(0, -1);
+          continue;
+        }
+        value += char;
+      }
+    }
+
+    stdin.setRawMode(true);
+    stdin.setEncoding("utf8");
+    stdin.resume();
+    stdin.on("data", onData);
+  });
+}
+
+function readBatchPrompts(filePath) {
+  if (!existsSync(filePath)) throw new AppError("INVALID_BATCH_FILE", `批量文件不存在：${filePath}` );
+  const info = statSync(filePath);
+  if (!info.isFile()) throw new AppError("INVALID_BATCH_FILE", `批量路径不是文件：${filePath}` );
+  if (info.size > MAX_BATCH_FILE_BYTES) throw new AppError("INVALID_BATCH_FILE", "批量文件不能超过 1MB。" );
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, "utf8"));
+  } catch (error) {
+    throw new AppError("INVALID_BATCH_FILE", `批量文件不是有效 JSON：${filePath}`, { cause: error });
+  }
+  const prompts = Array.isArray(parsed) ? parsed : parsed?.prompts;
+  return validatePrompts(prompts);
+}
+
+function assertActionCombinations(flags) {
+  if (flags.batchFile && flags.batchInline) throw new AppError("INVALID_ARGUMENT", "--batch 与 --batch-inline 不能同时使用。" );
+  if (flags.edit && flags.batchFile) throw new AppError("INVALID_ARGUMENT", "--edit 不能和 --batch 同时使用。" );
+  if (flags.allowInsecureApiBase && flags.setApiBase === undefined) {
+    throw new AppError("INVALID_ARGUMENT", "--allow-insecure-api-base 只能与 --set-api-base 一起使用。" );
+  }
+  const actions = [
+    flags.getConfig,
+    flags.setKey !== undefined,
+    flags.setKeyStdin,
+    flags.setApiBase !== undefined,
+    flags.setQuickMode,
+    flags.setBatchMode,
+    flags.edit,
+    flags.batchFile !== undefined,
+    flags.batchInline,
+  ].filter(Boolean);
+  if (actions.length > 1) throw new AppError("INVALID_ARGUMENT", "一次只能执行一个配置或生成操作。" );
+}
+
+async function main(argv = process.argv.slice(2)) {
+  const { prompts, flags } = parseArgs(argv);
+  assertActionCombinations(flags);
+  if (flags.verbose) process.env.SUBKKAI_IMAGE_GEN_VERBOSE = "1";
+  const hasAction = Boolean(
+    flags.getConfig ||
+    flags.setKey !== undefined ||
+    flags.setKeyStdin ||
+    flags.setApiBase !== undefined ||
+    flags.setQuickMode ||
+    flags.setBatchMode ||
+    flags.edit ||
+    flags.batchFile ||
+    flags.batchInline ||
+    prompts.length,
+  );
+  if (flags.help || !hasAction) {
+    printUsage();
+    return;
+  }
+  const config = loadConfig();
 
   if (flags.getConfig) {
+    const apiKey = configuredApiKey(config);
     console.log(JSON.stringify({
-      hasKey: !!config.apiKey,
-      keyPreview: keyPreview(config.apiKey),
+      hasKey: Boolean(apiKey),
+      keyPreview: keyPreview(apiKey),
       quickMode: config.quickMode || null,
       batchMode: config.batchMode || null,
-      apiBase,
+      apiBase: normalizeBaseUrl(config.apiBase || DEFAULT_API_BASE, { allowInsecure: config.allowInsecureApiBase === true }),
+      allowInsecureApiBase: config.allowInsecureApiBase === true,
+      configPath: getConfigPath(),
     }, null, 2));
     return;
   }
 
-  if (flags.setKey) {
-    config.apiKey = flags.setKey;
+  if (flags.setKey !== undefined || flags.setKeyStdin) {
+    config.apiKey = flags.setKeyStdin ? await readKeyFromStdin() : normalizeApiKey(flags.setKey);
     saveConfig(config);
-    console.log(`✅ API Key 已保存\n🔑 Key: ${keyPreview(flags.setKey)}\n🔒 已保存到本地配置`);
+    console.log(`✅ API Key 已保存\n🔑 Key: ${keyPreview(config.apiKey)}\n🔒 只显示打码预览，不输出完整 Key`);
     return;
   }
 
-  if (flags.setApiBase) {
-    config.apiBase = normalizeBaseUrl(flags.setApiBase);
+  if (flags.setApiBase !== undefined) {
+    config.apiBase = normalizeBaseUrl(flags.setApiBase, { allowInsecure: flags.allowInsecureApiBase === true });
+    config.allowInsecureApiBase = flags.allowInsecureApiBase === true;
     saveConfig(config);
-    console.log(`✅ API Base 已保存: ${config.apiBase}`);
+    console.log(`✅ API Base 已保存: ${safeUrlForLog(config.apiBase)}`);
     return;
   }
 
   if (flags.setQuickMode) {
-    config.quickMode = {
-      quality: (flags.quality || config.quickMode?.quality || DEFAULTS.quality).toUpperCase(),
-      ratio: (flags.ratio || config.quickMode?.ratio || DEFAULTS.ratio).toLowerCase(),
-      count: Math.max(1, Math.min(flags.count || config.quickMode?.count || DEFAULTS.count, 4)),
-    };
+    config.quickMode = normalizeQuickMode({
+      quality: flags.quality ?? config.quickMode?.quality,
+      ratio: flags.ratio ?? config.quickMode?.ratio,
+      count: flags.count ?? config.quickMode?.count,
+    });
     saveConfig(config);
     const size = resolveSize(config.quickMode.quality, config.quickMode.ratio);
-    console.log(`✅ 快速模式已设置\n🎨 画质: ${config.quickMode.quality} ${QUALITY_EMOJI[config.quickMode.quality] || ""}\n📐 比例: ${RATIO_NAMES[config.quickMode.ratio] || config.quickMode.ratio} (${size})\n🔢 每次: ${config.quickMode.count} 张`);
+    console.log(`✅ 快速模式已设置\n🎨 分辨率档位: ${config.quickMode.quality} ${QUALITY_EMOJI[config.quickMode.quality] || ""}\n📐 比例: ${RATIO_NAMES[config.quickMode.ratio]} (${size})\n🔢 每次: ${config.quickMode.count} 张`);
     return;
   }
 
   if (flags.setBatchMode) {
-    config.batchMode = {
-      quality: (flags.quality || config.batchMode?.quality || DEFAULTS.quality).toUpperCase(),
-      ratio: (flags.ratio || config.batchMode?.ratio || DEFAULTS.ratio).toLowerCase(),
-      concurrency: Math.max(1, Math.min(flags.concurrency || config.batchMode?.concurrency || DEFAULTS.concurrency, 10)),
-    };
+    config.batchMode = normalizeBatchMode({
+      quality: flags.quality ?? config.batchMode?.quality,
+      ratio: flags.ratio ?? config.batchMode?.ratio,
+      concurrency: flags.concurrency ?? config.batchMode?.concurrency,
+    });
     saveConfig(config);
     const size = resolveSize(config.batchMode.quality, config.batchMode.ratio);
-    console.log(`✅ 批量模式已设置\n🎨 画质: ${config.batchMode.quality} ${QUALITY_EMOJI[config.batchMode.quality] || ""}\n📐 比例: ${RATIO_NAMES[config.batchMode.ratio] || config.batchMode.ratio} (${size})\n⚡ 并发: ${config.batchMode.concurrency}`);
+    console.log(`✅ 批量模式已设置\n🎨 分辨率档位: ${config.batchMode.quality} ${QUALITY_EMOJI[config.batchMode.quality] || ""}\n📐 比例: ${RATIO_NAMES[config.batchMode.ratio]} (${size})\n⚡ 并发: ${config.batchMode.concurrency}`);
     return;
   }
 
-  if (flags.help || (!flags.edit && !flags.batchFile && !flags.batchInline && prompts.length === 0)) {
-    printUsage();
-    return;
+  if (flags.edit) {
+    if (!flags.image) throw new AppError("INVALID_ARGUMENT", "--edit 需要 --image <path>。" );
+    if (prompts.length !== 1) throw new AppError("INVALID_ARGUMENT", "--edit 需要且只能需要一个 --prompt。" );
+  } else if (flags.batchFile || flags.batchInline) {
+    if (flags.batchFile && prompts.length) throw new AppError("INVALID_ARGUMENT", "--batch 模式不能同时传入 --prompt。" );
+    if (flags.batchInline) validatePrompts(prompts);
+  } else {
+    if (prompts.length !== 1) throw new AppError("INVALID_ARGUMENT", "单图生成只能传入一个 --prompt。" );
+    validatePrompt(prompts[0]);
   }
 
-  const apiKey = getApiKey();
+  const apiKey = getApiKey(config);
+  const apiBase = normalizeBaseUrl(config.apiBase || DEFAULT_API_BASE, { allowInsecure: config.allowInsecureApiBase === true });
   const outputDir = resolveOutputDir(flags.outputDir);
 
   if (flags.edit) {
-    if (!flags.image) throw new Error("--edit requires --image <path>.");
-    if (!prompts.length) throw new Error("--edit requires --prompt <text>.");
     const { quality, ratio, size } = resolveModeParams(flags, config.quickMode);
     console.log(`✏️ 编辑中: ${basename(flags.image)}`);
-    console.log(`🎨 ${quality} ${RATIO_NAMES[ratio] || ratio} (${size})`);
+    console.log(`🎨 ${quality} ${RATIO_NAMES[ratio]} (${size})`);
     const result = await runEdit({ apiBase, apiKey, imagePath: flags.image, prompt: prompts[0], size, outputDir });
-    console.log(`✅ ${(result.elapsed / 1000).toFixed(1)}s`);
+    console.log(`✅ ${(result.elapsed / 1_000).toFixed(1)}s`);
     for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
     return;
   }
 
-  const isBatch = !!flags.batchFile || !!flags.batchInline;
+  const isBatch = Boolean(flags.batchFile || flags.batchInline);
   const { quality, ratio, size } = resolveModeParams(flags, isBatch ? config.batchMode : config.quickMode);
 
   if (flags.batchFile) {
-    const parsed = JSON.parse(readFileSync(flags.batchFile, "utf-8"));
-    const batchPrompts = Array.isArray(parsed) ? parsed : parsed.prompts;
-    if (!Array.isArray(batchPrompts) || !batchPrompts.length) throw new Error("Batch file must contain a JSON array or { prompts: [] }.");
-    const concurrency = Math.max(1, Math.min(flags.concurrency || config.batchMode?.concurrency || DEFAULTS.concurrency, 10));
+    const batchPrompts = readBatchPrompts(flags.batchFile);
+    const concurrency = parseInteger(flags.concurrency ?? config.batchMode?.concurrency ?? DEFAULTS.concurrency, "并发数", 1, 10);
     process.exitCode = await runBatch({ apiBase, apiKey, prompts: batchPrompts, size, concurrency, outputDir });
     return;
   }
 
   if (flags.batchInline) {
-    if (!prompts.length) throw new Error("--batch-inline requires at least one prompt.");
-    const concurrency = Math.max(1, Math.min(flags.concurrency || config.batchMode?.concurrency || DEFAULTS.concurrency, 10));
+    const concurrency = parseInteger(flags.concurrency ?? config.batchMode?.concurrency ?? DEFAULTS.concurrency, "并发数", 1, 10);
     process.exitCode = await runBatch({ apiBase, apiKey, prompts, size, concurrency, outputDir });
     return;
   }
 
-  const count = Math.max(1, Math.min(flags.count || config.quickMode?.count || DEFAULTS.count, 4));
-  const prompt = prompts[0];
+  const count = parseInteger(flags.count ?? config.quickMode?.count ?? DEFAULTS.count, "生成数量", 1, 4);
   if (count > 1) {
-    process.exitCode = await runBatch({ apiBase, apiKey, prompts: Array(count).fill(prompt), size, concurrency: Math.min(count, 4), outputDir });
+    process.exitCode = await runBatch({ apiBase, apiKey, prompts: Array(count).fill(prompts[0]), size, concurrency: Math.min(count, 4), outputDir });
     return;
   }
 
   console.log(`⏳ 生成中...`);
-  console.log(`🎨 ${quality} ${RATIO_NAMES[ratio] || ratio} (${size})`);
-  const result = await runGeneration({ apiBase, apiKey, prompt, size, outputDir });
-  console.log(`🎨 "${prompt}"`);
-  console.log(`✅ ${(result.elapsed / 1000).toFixed(1)}s`);
+  console.log(`🎨 ${quality} ${RATIO_NAMES[ratio]} (${size})`);
+  const result = await runGeneration({ apiBase, apiKey, prompt: prompts[0], size, outputDir });
+  console.log(`✅ ${(result.elapsed / 1_000).toFixed(1)}s`);
   for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
 }
 
-main().catch((error) => {
-  console.error(`❌ ${error.message}`);
-  process.exit(1);
-});
+function isMainModule() {
+  return Boolean(process.argv[1]) && pathToFileURL(resolvePath(process.argv[1])).href === import.meta.url;
+}
+
+export {
+  AppError,
+  DEFAULTS,
+  SIZE_MATRIX,
+  createEditTask,
+  createGenerationTask,
+  extractImageItems,
+  fetchImageResponse,
+  friendlyErrorMessage,
+  loadConfig,
+  main,
+  normalizeBaseUrl,
+  parseArgs,
+  pollTask,
+  requestJson,
+  resolveModeParams,
+  saveConfig,
+  saveImageItem,
+  sanitizeText,
+  validateConfig,
+  validateImageBuffer,
+  validatePrompt,
+  validatePrompts,
+  readBatchPrompts,
+};
+
+if (isMainModule()) {
+  main().catch((error) => {
+    const key = process.env.SUBKKAI_IMAGE_GEN_API_KEY || "";
+    const prefix = error?.code ? `[${error.code}] ` : "";
+    console.error(`❌ ${prefix}${friendlyErrorMessage(error, [key])}`);
+    process.exitCode = 1;
+  });
+}
