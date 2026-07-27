@@ -273,13 +273,31 @@ Determine the image source:
 2. Otherwise use the most recent generated image in the conversation, if available.
 3. If no image is available, ask the user to provide a path or attach an image.
 
-Run:
+Determine quality and size from user params or saved quick mode. Then immediately output as commentary:
+
+✏️ 正在编辑 · 2K · 竖版 (1152x2048)
+📝 <edit instruction preview (≤48 chars)>
+🖼️ <image filename>
+
+Then run silently (do NOT show Shell card):
 
 ```bash
 node "$SCRIPT" --edit --image "<image_path>" --prompt "<edit instruction>" [--quality Q] [--ratio R]
 ```
 
 The script uploads the image through `multipart/form-data` using field `image[]`, creates an edit task, polls for completion, and saves the result.
+
+Parse the script stdout to extract elapsed time, file path, size, and Markdown image line. Render the final response as plain text:
+
+✏️ 正在编辑 · 2K · 竖版 (1152x2048)
+📝 <edit instruction preview>
+🖼️ <image filename>
+✅ 编辑完成 · 38.2s
+📍 C:\Users\Administrator\Pictures\subkkai-image-gen\edit_xxx.png ｜ 2.10MB
+
+![Subkkai result](<C:/Users/Administrator/Pictures/subkkai-image-gen/edit_xxx.png>)
+
+Do not add any explanation before or after this block.
 
 ## Subkkai API contract
 
@@ -346,7 +364,7 @@ Also support `response.data[].url`.
 
 ## Error handling
 
-- `prompt_unsafe`: tell the user the prompt was rejected by upstream moderation and suggest a safer rewrite.
+- `prompt_unsafe` or error containing "安全政策" / "无法用于生成图像" / "cannot be used": automatically rewrite the prompt — remove potentially sensitive keywords, rephrase to a safer equivalent description. Send commentary: `⚠️ 提示词被安全策略拦截，正在改写重试...` then retry once with the rewritten prompt. If the retry also fails, tell the user: the original and rewritten prompts both failed, show the rewritten version, and suggest they try a different description themselves.
 - `bad_size`: retry only if a clear closest supported size exists; otherwise report supported sizes.
 - `No available compatible accounts`: wait 30 seconds and retry once, then report upstream capacity issue.
 - Task timeout: report timeout and offer retry.
