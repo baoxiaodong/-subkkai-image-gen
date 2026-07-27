@@ -5,16 +5,19 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, extname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
+
+import { checkForUpdate } from "./check-update.mjs";
 
 const DEFAULT_API_BASE = "https://subkkai.com";
 const MODEL = "gpt-image-2";
@@ -30,6 +33,7 @@ const MAX_BATCH_FILE_BYTES = 1024 * 1024;
 const MAX_ERROR_LENGTH = 1_200;
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const SUPPORTED_IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 
 const SIZE_MATRIX = {
   "1K": { square: "1024x1024", landscape: "1536x1024", portrait: "1024x1536" },
@@ -62,6 +66,37 @@ function getConfigPath() {
 
 function getDefaultOutputDir() {
   return process.env.SUBKKAI_IMAGE_GEN_OUTPUT_DIR?.trim() || join(homedir(), "Pictures", "subkkai-image-gen");
+}
+
+function findLatestImage(outputDir = getDefaultOutputDir()) {
+  const resolvedDir = resolvePath(outputDir);
+  if (!existsSync(resolvedDir)) {
+    throw new AppError("NO_IMAGE_AVAILABLE", "还没有可编辑的历史图片，请先生成、附加图片或提供图片路径。" );
+  }
+
+  const candidates = readdirSync(resolvedDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && SUPPORTED_IMAGE_EXTENSIONS.has(extname(entry.name).toLowerCase()))
+    .map((entry) => {
+      const path = join(resolvedDir, entry.name);
+      const info = statSync(path);
+      return { path, modifiedAt: info.mtimeMs, size: info.size };
+    })
+    .filter((entry) => entry.size > 0)
+    .sort((left, right) => right.modifiedAt - left.modifiedAt || right.path.localeCompare(left.path));
+
+  if (!candidates.length) {
+    throw new AppError("NO_IMAGE_AVAILABLE", "还没有可编辑的历史图片，请先生成、附加图片或提供图片路径。" );
+  }
+  return candidates[0].path;
+}
+
+async function printUpdateNotice() {
+  try {
+    const result = await checkForUpdate();
+    if (result.shouldNotify && result.notice) console.log(result.notice);
+  } catch {
+    // Update checks must never delay a user with an actionable error.
+  }
 }
 
 function isPlainObject(value) {
@@ -477,6 +512,62 @@ function detectMimeType(buffer) {
   return null;
 }
 
+function readUInt24LE(buffer, offset) {
+  if (offset < 0 || offset + 3 > buffer.length) return null;
+  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+}
+
+function readJpegDimensions(buffer) {
+  let offset = 2;
+  const startOfFrameMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  while (offset + 1 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+    if (offset >= buffer.length) break;
+    const marker = buffer[offset++];
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > buffer.length) break;
+    const segmentLength = buffer.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > buffer.length) break;
+    if (startOfFrameMarkers.has(marker) && segmentLength >= 7) {
+      return { width: buffer.readUInt16BE(offset + 5), height: buffer.readUInt16BE(offset + 3) };
+    }
+    offset += segmentLength;
+  }
+  return null;
+}
+
+function readWebpDimensions(buffer) {
+  const chunkType = buffer.subarray(12, 16).toString("ascii");
+  if (chunkType === "VP8X" && buffer.length >= 30) {
+    const width = readUInt24LE(buffer, 24);
+    const height = readUInt24LE(buffer, 27);
+    return width === null || height === null ? null : { width: width + 1, height: height + 1 };
+  }
+  if (chunkType === "VP8 " && buffer.length >= 30 && buffer.subarray(23, 26).equals(Buffer.from([0x9d, 0x01, 0x2a]))) {
+    return { width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
+  }
+  if (chunkType === "VP8L" && buffer.length >= 25 && buffer[20] === 0x2f) {
+    const bits = buffer.readUInt32LE(21);
+    return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+  }
+  return null;
+}
+
+function readImageDimensions(buffer, mimeType = detectMimeType(buffer)) {
+  if (!Buffer.isBuffer(buffer)) return null;
+  if (mimeType === "image/png" && buffer.length >= 24 && buffer.subarray(12, 16).toString("ascii") === "IHDR") {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+  if (mimeType === "image/jpeg") return readJpegDimensions(buffer);
+  if (mimeType === "image/webp") return readWebpDimensions(buffer);
+  return null;
+}
+
 function validateImageBuffer(buffer, label = "图片") {
   if (!Buffer.isBuffer(buffer) || !buffer.length) throw new AppError("INVALID_IMAGE", `${label} 为空。` );
   if (buffer.length > MAX_IMAGE_BYTES) throw new AppError("IMAGE_TOO_LARGE", `${label} 超过 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB 限制。` );
@@ -623,9 +714,17 @@ async function saveImageItem(item, outputDir, prefix) {
   }
 
   const mimeType = validateImageBuffer(buffer, "输出图片");
+  const dimensions = readImageDimensions(buffer, mimeType);
   const filePath = createOutputPath(outputDir, prefix, extensionForMimeType(mimeType));
   writeBufferAtomically(filePath, buffer);
-  return { path: filePath, bytes: buffer.length, fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB` };
+  return {
+    path: filePath,
+    bytes: buffer.length,
+    fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB`,
+    width: dimensions?.width ?? null,
+    height: dimensions?.height ?? null,
+    dimensions: dimensions ? `${dimensions.width}x${dimensions.height}` : null,
+  };
 }
 
 function extractTaskStatus(task) {
@@ -883,6 +982,24 @@ function compactPromptPreview(prompt, maxLength = 48) {
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized;
 }
 
+function markdownImage(filePath) {
+  const normalized = String(filePath).replaceAll("\\", "/").replaceAll("<", "%3C").replaceAll(">", "%3E");
+  return `![Subkkai result](<${normalized}>)`;
+}
+
+function dimensionStatus(saved, requestedSize) {
+  const dimensions = [...new Set(saved.map((file) => file.dimensions).filter(Boolean))];
+  if (!dimensions.length) return "";
+  if (dimensions.length === 1 && dimensions[0] === requestedSize) return ` · ${dimensions[0]}`;
+  return ` · ⚠️ 实际 ${dimensions.join(", ")}（请求 ${requestedSize}）`;
+}
+
+function savedFileLine(marker, file) {
+  const details = [file.fileSize];
+  if (file.dimensions) details.push(file.dimensions);
+  return `${marker} ${file.path} ｜ ${details.join(" ｜ ")}`;
+}
+
 function promptPreview(prompt) {
   if (verboseOutputEnabled()) return `: "${sanitizeText(prompt).slice(0, 80)}${prompt.length > 80 ? "..." : ""}"`;
   return "";
@@ -910,7 +1027,7 @@ async function runBatch({ apiBase, apiKey, prompts, size, concurrency, outputDir
           progressOutput: false,
         });
         results[index] = { prompt, ok: true, ...result };
-        console.log(`✅ [${index + 1}/${prompts.length}] ${(result.elapsed / 1_000).toFixed(1)}s`);
+        console.log(`✅ [${index + 1}/${prompts.length}] ${(result.elapsed / 1_000).toFixed(1)}s${dimensionStatus(result.saved, size)}`);
       } catch (error) {
         results[index] = { prompt, ok: false, error: friendlyErrorMessage(error, [apiKey]) };
         console.log(`❌ [${index + 1}/${prompts.length}] ${results[index].error}`);
@@ -924,7 +1041,7 @@ async function runBatch({ apiBase, apiKey, prompts, size, concurrency, outputDir
   for (const [index, result] of results.entries()) {
     if (result.ok) {
       console.log(`🎨 #${index + 1} ✅`);
-      for (const file of result.saved) console.log(`📁 ${file.path} ｜ ${file.fileSize}`);
+      for (const file of result.saved) console.log(savedFileLine("📁", file));
     } else {
       console.log(`🎨 #${index + 1} ❌ ${result.error}`);
     }
@@ -995,6 +1112,7 @@ function parseArgs(argv) {
       }
       if (!added) throw new AppError("INVALID_ARGUMENT", "--batch-inline 至少需要一个 prompt。" );
     } else if (arg === "--edit") args.flags.edit = true;
+    else if (arg === "--latest-image") args.flags.latestImage = true;
     else if (arg === "--image") {
       args.flags.image = requireValue(argv, index, arg);
       index += 1;
@@ -1026,6 +1144,7 @@ GENERATE:
 
 EDIT:
   --edit --image <path> --prompt "..." [--quality Q] [--ratio R]
+  --edit --latest-image --prompt "..." [--quality Q] [--ratio R]
 `);
 }
 
@@ -1108,6 +1227,8 @@ function readBatchPrompts(filePath) {
 function assertActionCombinations(flags) {
   if (flags.batchFile && flags.batchInline) throw new AppError("INVALID_ARGUMENT", "--batch 与 --batch-inline 不能同时使用。" );
   if (flags.edit && flags.batchFile) throw new AppError("INVALID_ARGUMENT", "--edit 不能和 --batch 同时使用。" );
+  if (flags.latestImage && !flags.edit) throw new AppError("INVALID_ARGUMENT", "--latest-image 只能与 --edit 一起使用。" );
+  if (flags.latestImage && flags.image) throw new AppError("INVALID_ARGUMENT", "--latest-image 与 --image 不能同时使用。" );
   if (flags.allowInsecureApiBase && flags.setApiBase === undefined) {
     throw new AppError("INVALID_ARGUMENT", "--allow-insecure-api-base 只能与 --set-api-base 一起使用。" );
   }
@@ -1201,7 +1322,9 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   if (flags.edit) {
-    if (!flags.image) throw new AppError("INVALID_ARGUMENT", "--edit 需要 --image <path>。" );
+    if (!flags.image && !flags.latestImage) {
+      throw new AppError("INVALID_ARGUMENT", "--edit 需要 --image <path> 或 --latest-image。" );
+    }
     if (prompts.length !== 1) throw new AppError("INVALID_ARGUMENT", "--edit 需要且只能需要一个 --prompt。" );
   } else if (flags.batchFile || flags.batchInline) {
     if (flags.batchFile && prompts.length) throw new AppError("INVALID_ARGUMENT", "--batch 模式不能同时传入 --prompt。" );
@@ -1215,14 +1338,18 @@ async function main(argv = process.argv.slice(2)) {
   const apiBase = normalizeBaseUrl(config.apiBase || DEFAULT_API_BASE, { allowInsecure: config.allowInsecureApiBase === true });
   const outputDir = resolveOutputDir(flags.outputDir);
 
+  await printUpdateNotice();
+
   if (flags.edit) {
+    const imagePath = flags.latestImage ? findLatestImage(outputDir) : resolvePath(flags.image);
     const { quality, ratio, size } = resolveModeParams(flags, config.quickMode);
     console.log(`✏️ 正在编辑 · ${quality} · ${RATIO_NAMES[ratio]} (${size})`);
     console.log(`📝 ${compactPromptPreview(prompts[0])}`);
-    if (verboseOutputEnabled()) console.log(`🖼️ ${basename(flags.image)}`);
-    const result = await runEdit({ apiBase, apiKey, imagePath: flags.image, prompt: prompts[0], size, outputDir });
-    console.log(`✅ 编辑完成 · ${(result.elapsed / 1_000).toFixed(1)}s`);
-    for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
+    if (verboseOutputEnabled()) console.log(`🖼️ ${basename(imagePath)}`);
+    const result = await runEdit({ apiBase, apiKey, imagePath, prompt: prompts[0], size, outputDir });
+    console.log(`✅ 编辑完成 · ${(result.elapsed / 1_000).toFixed(1)}s${dimensionStatus(result.saved, size)}`);
+    for (const file of result.saved) console.log(savedFileLine("📍", file));
+    for (const file of result.saved) console.log(markdownImage(file.path));
     return;
   }
 
@@ -1251,8 +1378,9 @@ async function main(argv = process.argv.slice(2)) {
   console.log(`🎨 正在生成 · ${quality} · ${RATIO_NAMES[ratio]} (${size})`);
   console.log(`📝 ${compactPromptPreview(prompts[0])}`);
   const result = await runGeneration({ apiBase, apiKey, prompt: prompts[0], size, outputDir });
-  console.log(`✅ 生成完成 · ${(result.elapsed / 1_000).toFixed(1)}s`);
-  for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
+  console.log(`✅ 生成完成 · ${(result.elapsed / 1_000).toFixed(1)}s${dimensionStatus(result.saved, size)}`);
+  for (const file of result.saved) console.log(savedFileLine("📍", file));
+  for (const file of result.saved) console.log(markdownImage(file.path));
 }
 
 function isMainModule() {
@@ -1268,17 +1396,21 @@ export {
   createLiveProgress,
   extractImageItems,
   fetchImageResponse,
+  findLatestImage,
   friendlyErrorMessage,
   loadConfig,
   main,
+  markdownImage,
   normalizeBaseUrl,
   parseArgs,
   pollTask,
+  readImageDimensions,
   reportTaskProgress,
   requestJson,
   resolveModeParams,
   saveConfig,
   saveImageItem,
+  dimensionStatus,
   sanitizeText,
   validateConfig,
   validateImageBuffer,

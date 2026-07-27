@@ -25,13 +25,28 @@ Restart Codex, then use:
 
 ## Fast response behavior
 
-Normal single-image generation and editing show a short prompt preview, a
-compact start line with the effective resolution, a one-line live timer when a
-TTY is available, a completion line, and then the finished image. Non-TTY
-environments fall back to one status line every 60 seconds. Update checks,
-configuration reads, task IDs, and automatic visual review stay out of the
-user-facing response. Use `--verbose` only when task IDs and additional
-diagnostics are needed.
+Normal single-image generation and editing use one CLI command. The skill does
+not pre-read config, separately check for updates, scan output folders, or
+prepare a PTY. The CLI handles config and the cached update check internally,
+shows a short prompt/size preview, uses a one-line live timer when a TTY is
+already available, and falls back to one status line every 60 seconds otherwise.
+Use `--verbose` only when task IDs and additional diagnostics are needed.
+
+For requests such as “edit the previous image”, the fast path is:
+
+```powershell
+node <plugin-root>/scripts/generate.mjs --edit --latest-image --prompt "..."
+```
+
+## v0.1.3 更新内容
+
+- 生图、改图收到明确需求后直接运行一条命令，不再先读配置或单独检查更新。
+- “编辑上一张图”由 CLI 自动找到最近输出图片，不再让 Codex 花时间找路径。
+- 不再强制准备 TTY；有 TTY 就单行动态计时，没有就自动低频提示。
+- 更新提醒继续保留，但已并入实际生图命令。
+- CLI 直接输出 Markdown 图片行，Codex 无需再复制或编码结果文件。
+- 完成后显示实际图片尺寸；上游返回尺寸与请求不一致时会明确告警。
+- 增加最近图片编辑的模拟 API 全链路测试。
 
 ## v0.1.2 更新内容
 
@@ -103,6 +118,7 @@ supports them.
 
 - Single-image generation and 1K/2K/4K size presets.
 - Existing-image editing for PNG, JPEG, and WebP inputs.
+- Direct editing of the newest generated image with `--latest-image`.
 - Batch generation of up to 20 prompts with up to 10 workers.
 - One-line live TTY progress with a sparse 60-second non-TTY fallback.
 - Batch filenames numbered in prompt order (`img_01_...`, `img_02_...`).
