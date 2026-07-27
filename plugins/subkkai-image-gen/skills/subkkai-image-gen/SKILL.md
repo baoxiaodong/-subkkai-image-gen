@@ -1,4 +1,4 @@
-﻿---
+---
 name: "subkkai-image-gen"
 description: "Generate or edit images using the Subkkai Image Gen plugin. Trigger when the user wants to create, draw, generate, or edit images through Subkkai gpt-image-2 task-mode APIs, wants batch image generation, needs AI-generated images saved to disk, or wants to modify an existing image. Do not use for SVG/vector work or unrelated image tools."
 ---
@@ -150,18 +150,29 @@ node "$SCRIPT" --prompt "<prompt>" [--quality Q] [--ratio R] [--count N]
 
 Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requested them. Otherwise omit these flags and let the script use saved quick mode. The script creates a Subkkai task, polls `GET /v1/image-tasks/{id}`, saves the final image, and prints the output path.
 
-On success, parse the script output and re-render it as plain text in your response. Do NOT show the Shell tool output. Expected final response shape (no code block, no shell card):
+**Output workflow:**
 
-🎨 正在生成 · 2K · 竖版 (1152x2048)
-📝 小女孩在教室里写作业
-⏳ 生成中 · 18s
-✅ 生成完成 · 42.6s
-📍 C:\Users\Administrator\Pictures\subkkai-image-gen\xxx.png ｜ 1.23MB
+1. Immediately send a commentary message with the initial status (no code block):
+   ```
+   🎨 正在生成 · 2K · 竖版 (1152x2048)
+   📝 小女孩在教室里写作业
+   ```
+2. Run the script silently (do NOT show the Shell tool card).
+3. If the script runs longer than 60 seconds, send a commentary update every 30-60 seconds:
+   ```
+   ⏳ 还在生成中...
+   ```
+4. When the script completes, parse its stdout and render the final response as plain text (no code block, no shell card):
+   ```
+   🎨 正在生成 · 2K · 竖版 (1152x2048)
+   📝 小女孩在教室里写作业
+   ✅ 生成完成 · 42.6s
+   📍 C:\Users\Administrator\Pictures\subkkai-image-gen\xxx.png ｜ 1.23MB
 
-![Subkkai result](<C:/Users/Administrator/Pictures/subkkai-image-gen/xxx.png>)
+   ![Subkkai result](<C:/Users/Administrator/Pictures/subkkai-image-gen/xxx.png>)
+   ```
 
-Do not add any explanation before or after this block.
-
+Do not add any explanation before or after the final block.
 ## Branch C: Modify config
 
 Show current config from `--get-config`, then output this with values filled in:
@@ -298,6 +309,24 @@ Parse the script stdout to extract elapsed time, file path, size, and Markdown i
 ![Subkkai result](<C:/Users/Administrator/Pictures/subkkai-image-gen/edit_xxx.png>)
 
 Do not add any explanation before or after this block.
+
+## Branch G: Check update
+
+Trigger when the user asks "检查更新", "有没有新版本", "check for updates", or similar.
+
+Run:
+
+```bash
+node "$SCRIPT_DIR/check-update.mjs"
+```
+
+Show the script output directly to the user. The script checks the GitHub repository for a newer version and shows upgrade instructions if available.
+
+To force a check (ignoring the cached interval), run:
+
+```bash
+node "$SCRIPT_DIR/check-update.mjs" --force
+```
 
 ## Subkkai API contract
 
