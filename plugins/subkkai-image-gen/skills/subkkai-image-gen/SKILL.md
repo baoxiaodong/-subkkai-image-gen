@@ -152,20 +152,18 @@ Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requeste
 
 **Output workflow:**
 
-1. Immediately send a commentary message with the initial status (no code block):
+1. Immediately send a commentary message with the generation parameters (no code block):
    ```
    🎨 正在生成 · 2K · 竖版 (1152x2048)
    📝 小女孩在教室里写作业
    ```
-2. Run the script silently (do NOT show the Shell tool card).
+2. Run the script silently (do NOT show the Shell tool card output as part of your response text).
 3. If the script runs longer than 60 seconds, send a commentary update every 30-60 seconds:
    ```
    ⏳ 还在生成中...
    ```
-4. When the script completes, parse its stdout and render the final response as plain text (no code block, no shell card):
+4. When the script completes, parse its stdout and render the final response as plain text (no code block, no shell card). Do NOT repeat the generation parameters already shown in step 1. Expected final response shape:
    ```
-   🎨 正在生成 · 2K · 竖版 (1152x2048)
-   📝 小女孩在教室里写作业
    ✅ 生成完成 · 42.6s
    📍 C:\Users\Administrator\Pictures\subkkai-image-gen\xxx.png ｜ 1.23MB
 
