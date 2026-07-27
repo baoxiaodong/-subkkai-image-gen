@@ -116,7 +116,7 @@ Show this exactly, then wait for the choice:
 > |------|--------|------|----------|
 > | **1K** 🚀 | ~1百万像素 | 最快 | 草稿、缩略图、测试 |
 > | **2K** ✨ _(推荐)_ | ~4百万像素 | 平衡 | 日常使用、微信出图 |
-> | **4K** 💎 | ~8百万像素 | 较慢 | 高清大图、细节图 |
+> | **4K** 💎 | ~8百万像素 | 上游繁忙时可能超时 | 高清大图、细节图 |
 
 Map the choice to `1K`, `2K`, or `4K`. If the user says “推荐” or “默认”, use
 `2K`, then continue to Step 3.

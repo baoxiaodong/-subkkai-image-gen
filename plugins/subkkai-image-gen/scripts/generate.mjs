@@ -21,7 +21,7 @@ import { checkForUpdate } from "./check-update.mjs";
 
 const DEFAULT_API_BASE = "https://subkkai.com";
 const MODEL = "gpt-image-2";
-const TASK_TIMEOUT_MS = 300_000;
+const TASK_TIMEOUT_MS = 180_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const INITIAL_POLL_MS = 700;
 const MAX_POLL_MS = 8_000;
@@ -811,6 +811,7 @@ function friendlyErrorMessage(error, secrets = []) {
   if (/bad_size/i.test(raw)) return "上游不支持当前尺寸，请改用 1K/2K/4K 与 square/landscape/portrait 的组合。";
   if (/No available compatible accounts/i.test(raw)) return "上游暂时没有可用生图资源，请等待约 30 秒后重试。";
   if (code === "TASK_TIMEOUT") return `${raw} 远端任务可能仍在运行，请稍后查询或确认后再重试。`;
+  if (/已超时|task (?:has )?timed out|upstream.*timeout/i.test(raw)) return "上游任务处理超时，插件没有自动重试以避免重复扣费。请稍后重试；高分辨率场景建议先使用 2K。";
   if (code === "NETWORK_TIMEOUT") return `${raw} 请检查网络或稍后重试。`;
   if (code === "MISSING_API_KEY") return `${raw} 可使用 SUBKKAI_IMAGE_GEN_API_KEY，或通过 stdin 配置。`;
   if (code === "MISSING_QUICK_MODE") return `${raw} 请先完成画质、比例和数量的首次设置。`;

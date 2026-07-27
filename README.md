@@ -31,6 +31,11 @@ prepare a PTY. The CLI handles config and the cached update check internally,
 shows a short prompt/size preview, and refreshes one live timer line in both TTY
 terminals and Codex non-TTY command cards. Other log-only pipes fall back to one
 status line every 60 seconds.
+
+For interactive image generation, polling stops after three minutes rather
+than leaving users waiting indefinitely. It never creates a duplicate paid
+task while waiting.
+
 Use `--verbose` only when task IDs and additional diagnostics are needed.
 
 ## First-time setup
@@ -125,7 +130,8 @@ supports them.
 
 ## Supported operations
 
-- Single-image generation and 1K/2K/4K size presets.
+- Single-image generation and 1K/2K/4K size presets; 4K depends on upstream
+  capacity, so 2K remains the recommended default for normal use.
 - Existing-image editing for PNG, JPEG, and WebP inputs.
 - Direct editing of the newest generated image with `--latest-image`.
 - Batch generation of up to 20 prompts with up to 10 workers.

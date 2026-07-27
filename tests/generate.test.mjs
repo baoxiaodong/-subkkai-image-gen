@@ -723,6 +723,8 @@ test("AppError exposes stable machine-readable codes", () => {
 test("adds actionable hints to user-facing errors", () => {
   const timeout = friendlyErrorMessage(new AppError("TASK_TIMEOUT", "task timed out"));
   assert.match(timeout, /仍在运行|查询/);
+  const upstreamTimeout = friendlyErrorMessage(new AppError("TASK_FAILED", "已超时"));
+  assert.match(upstreamTimeout, /重复扣费|2K/);
   const unsafe = friendlyErrorMessage(new AppError("TASK_FAILED", "prompt_unsafe"));
   assert.match(unsafe, /安全策略|改写/);
 });
