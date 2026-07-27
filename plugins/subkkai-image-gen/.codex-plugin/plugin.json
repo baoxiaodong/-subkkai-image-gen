@@ -1,4 +1,4 @@
-﻿{
+{
     "name":  "subkkai-image-gen",
     "version": "0.1.3",
     "description":  "Generate and edit images through Subkkai task-mode gpt-image-2 APIs with local config, polling, batch mode, and saved PNG outputs.",
