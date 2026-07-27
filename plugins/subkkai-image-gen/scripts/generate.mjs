@@ -41,6 +41,38 @@ function markdownImage(filePath) {
   return `![Subkkai result](<${normalized}>)`;
 }
 
+function createStatusTimer(label) {
+  const startedAt = Date.now();
+  const live = process.stdout.isTTY === true;
+  let stopped = false;
+  let width = 0;
+
+  const render = () => {
+    if (stopped) return;
+    const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+    const line = `⏳ ${label} · ${elapsedSeconds}s`;
+    const padding = " ".repeat(Math.max(0, width - line.length));
+    process.stdout.write(`\r${line}${padding}`);
+    width = Math.max(width, line.length);
+  };
+
+  if (live) render();
+  const timer = live ? setInterval(render, 1000) : null;
+  timer?.unref?.();
+
+  return {
+    stop() {
+      if (stopped) return;
+      if (live) render();
+      stopped = true;
+      if (timer) clearInterval(timer);
+      const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+      if (live) process.stdout.write("\n");
+      else console.log(`⏳ ${label} · ${elapsedSeconds}s`);
+    },
+  };
+}
+
 function loadConfig() {
   if (!existsSync(CONFIG_PATH)) return null;
   try {
@@ -201,6 +233,21 @@ function extractImageItems(task) {
   return Array.isArray(data) ? data : [];
 }
 
+async function fetchImageBuffer(url, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return Buffer.from(await response.arrayBuffer());
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await sleep(800 * attempt);
+    }
+  }
+  throw new Error(`Download failed after ${attempts} attempts: ${lastError?.message || "unknown error"}`);
+}
+
 async function saveImageItem(item, outputDir, prefix) {
   const filename = `${prefix}_${timestamp()}_${Math.random().toString(36).slice(2, 6)}.png`;
   const filepath = join(outputDir, filename);
@@ -212,9 +259,7 @@ async function saveImageItem(item, outputDir, prefix) {
   }
 
   if (item.url) {
-    const response = await fetch(item.url);
-    if (!response.ok) throw new Error(`Download failed HTTP ${response.status}: ${item.url}`);
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const buffer = await fetchImageBuffer(item.url);
     writeFileSync(filepath, buffer);
     return { path: filepath, fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB` };
   }
@@ -411,8 +456,13 @@ async function main() {
     console.log(`✏️ 正在编辑 · ${quality} · ${RATIO_NAMES[ratio] || ratio} (${size})`);
     console.log(`📝 ${promptPreview(prompts[0])}`);
     console.log(`🖼️ ${basename(flags.image)}`);
-    console.log(`⏳ 编辑中`);
-    const result = await runEdit({ apiBase, apiKey, imagePath: flags.image, prompt: prompts[0], size, outputDir });
+    const statusTimer = createStatusTimer("编辑中");
+    let result;
+    try {
+      result = await runEdit({ apiBase, apiKey, imagePath: flags.image, prompt: prompts[0], size, outputDir });
+    } finally {
+      statusTimer.stop();
+    }
     console.log(`✅ 编辑完成 · ${(result.elapsed / 1000).toFixed(1)}s`);
     for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
     for (const file of result.saved) console.log(markdownImage(file.path));
@@ -447,8 +497,13 @@ async function main() {
 
   console.log(`🎨 正在生成 · ${quality} · ${RATIO_NAMES[ratio] || ratio} (${size})`);
   console.log(`📝 ${promptPreview(prompt)}`);
-  console.log(`⏳ 生成中`);
-  const result = await runGeneration({ apiBase, apiKey, prompt, size, outputDir });
+  const statusTimer = createStatusTimer("生成中");
+  let result;
+  try {
+    result = await runGeneration({ apiBase, apiKey, prompt, size, outputDir });
+  } finally {
+    statusTimer.stop();
+  }
   console.log(`✅ 生成完成 · ${(result.elapsed / 1000).toFixed(1)}s`);
   for (const file of result.saved) console.log(`📍 ${file.path} ｜ ${file.fileSize}`);
   for (const file of result.saved) console.log(markdownImage(file.path));

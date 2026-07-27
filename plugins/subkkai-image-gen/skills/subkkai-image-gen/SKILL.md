@@ -26,7 +26,7 @@ directory.
 ```text
 🎨 正在生成 · 2K · 竖版 (1152x2048)
 📝 小女孩在教室里写作业
-⏳ 生成中
+⏳ 生成中 · 18s
 ✅ 生成完成 · 42.6s
 📍 C:\Users\Administrator\Pictures\subkkai-image-gen\xxx.png ｜ 1.23MB
 ```
