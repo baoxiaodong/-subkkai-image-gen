@@ -854,18 +854,32 @@ function createLiveProgress({
   now = Date.now,
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  allowNonTty,
 } = {}) {
-  if (output?.isTTY !== true) return null;
+  const liveProgressSetting = process.env.SUBKKAI_IMAGE_GEN_LIVE_PROGRESS;
+  const nonTtyEnabled = allowNonTty ?? (
+    liveProgressSetting === "1"
+    || (liveProgressSetting !== "0" && Boolean(process.env.CODEX_THREAD_ID))
+  );
+  if (typeof output?.write !== "function" || (output.isTTY !== true && !nonTtyEnabled)) return null;
   let currentStatus = "processing";
   let currentProgress = null;
   let stopped = false;
+  let previousLineWidth = 0;
 
   const render = () => {
     if (stopped) return;
     const parts = [`⏳ ${taskStatusLabel(currentStatus, activityLabel)}`];
     if (currentProgress !== null) parts.push(`${currentProgress}%`);
     parts.push(formatElapsedTime(startedAt, now()));
-    output.write(`\x1b[2K\r${parts.join(" · ")}`);
+    const line = parts.join(" · ");
+    if (output.isTTY === true) {
+      output.write(`\x1b[2K\r${line}`);
+      return;
+    }
+    const padding = " ".repeat(Math.max(0, previousLineWidth - line.length));
+    output.write(`\r${line}${padding}`);
+    previousLineWidth = Math.max(previousLineWidth, line.length);
   };
 
   render();
@@ -880,9 +894,10 @@ function createLiveProgress({
     },
     stop() {
       if (stopped) return;
-      stopped = true;
       clearIntervalFn(timer);
-      output.write("\x1b[2K\r");
+      render();
+      stopped = true;
+      output.write("\n");
     },
   };
 }

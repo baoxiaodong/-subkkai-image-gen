@@ -28,8 +28,9 @@ Restart Codex, then use:
 Normal single-image generation and editing use one CLI command. The skill does
 not pre-read config, separately check for updates, scan output folders, or
 prepare a PTY. The CLI handles config and the cached update check internally,
-shows a short prompt/size preview, uses a one-line live timer when a TTY is
-already available, and falls back to one status line every 60 seconds otherwise.
+shows a short prompt/size preview, and refreshes one live timer line in both TTY
+terminals and Codex non-TTY command cards. Other log-only pipes fall back to one
+status line every 60 seconds.
 Use `--verbose` only when task IDs and additional diagnostics are needed.
 
 For requests such as “edit the previous image”, the fast path is:
@@ -42,7 +43,7 @@ node <plugin-root>/scripts/generate.mjs --edit --latest-image --prompt "..."
 
 - 生图、改图收到明确需求后直接运行一条命令，不再先读配置或单独检查更新。
 - “编辑上一张图”由 CLI 自动找到最近输出图片，不再让 Codex 花时间找路径。
-- 不再强制准备 TTY；有 TTY 就单行动态计时，没有就自动低频提示。
+- 不再强制准备 TTY；TTY 和 Codex 非 TTY 命令卡都保留单行动态计时，其他日志管道自动低频提示。
 - 更新提醒继续保留，但已并入实际生图命令。
 - CLI 直接输出 Markdown 图片行，Codex 无需再复制或编码结果文件。
 - 完成后显示实际图片尺寸；上游返回尺寸与请求不一致时会明确告警。

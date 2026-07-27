@@ -20,7 +20,8 @@ message and immediately run exactly one image command. Do not first run
 `--get-config`, the separate update checker, directory listings, image searches,
 or visual inspection. Do not spend time preparing a PTY; use the shell's normal
 execution mode. The CLI loads saved config, performs the cached update check,
-and handles TTY/non-TTY progress itself.
+and keeps the compact visible status sequence itself, including Codex non-TTY
+command cards.
 
 Generate:
 
@@ -56,10 +57,14 @@ returns `NO_IMAGE_AVAILABLE`, ask the user to attach an image or provide a path.
 ## Response rules
 
 - Start with `🎨 正在生成。` or `✏️ 正在编辑。` and then execute immediately.
-- Keep prompts, config values, commands, task IDs, and polling details out of
+- Preserve the CLI's compact command-card sequence: effective quality/ratio,
+  short prompt preview, one in-place `⏳ 生成中 · 10s` timer line, completion
+  time, and the final Markdown image. Do not suppress these user-visible lines.
+- Keep commands, task IDs, polling internals, and extra explanations out of
   chat; the command card already contains the useful status.
-- Do not require PTY/TTY. In a TTY the CLI refreshes one timer line; otherwise it
-  emits a sparse status line every 60 seconds.
+- Do not require PTY/TTY. The CLI refreshes one timer line in TTY terminals and
+  Codex command cards, including Codex non-TTY execution. Log-only non-Codex
+  pipes retain a sparse 60-second fallback.
 - Do not inspect, critique, or describe the result unless the user explicitly
   asks for verification or review.
 - Do not ask for confirmation for one image. Confirm before batch generation.

@@ -57,6 +57,7 @@ function freshEnv() {
     updateDisabled: process.env.SUBKKAI_IMAGE_GEN_DISABLE_UPDATE_CHECK,
     updateUrl: process.env.SUBKKAI_IMAGE_GEN_UPDATE_URL,
     updateCache: process.env.SUBKKAI_IMAGE_GEN_UPDATE_CACHE,
+    liveProgress: process.env.SUBKKAI_IMAGE_GEN_LIVE_PROGRESS,
   };
   process.env.SUBKKAI_IMAGE_GEN_CONFIG = join(root, "config.json");
   process.env.SUBKKAI_IMAGE_GEN_OUTPUT_DIR = join(root, "output");
@@ -68,6 +69,7 @@ function freshEnv() {
   process.env.SUBKKAI_IMAGE_GEN_DISABLE_UPDATE_CHECK = "1";
   delete process.env.SUBKKAI_IMAGE_GEN_UPDATE_URL;
   delete process.env.SUBKKAI_IMAGE_GEN_UPDATE_CACHE;
+  process.env.SUBKKAI_IMAGE_GEN_LIVE_PROGRESS = "0";
   return { root, previous };
 }
 
@@ -83,6 +85,7 @@ function restoreEnv(root, previous) {
     SUBKKAI_IMAGE_GEN_DISABLE_UPDATE_CHECK: previous.updateDisabled,
     SUBKKAI_IMAGE_GEN_UPDATE_URL: previous.updateUrl,
     SUBKKAI_IMAGE_GEN_UPDATE_CACHE: previous.updateCache,
+    SUBKKAI_IMAGE_GEN_LIVE_PROGRESS: previous.liveProgress,
   })) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -415,7 +418,53 @@ test("updates the TTY timer in place without adding lines", () => {
   assert.ok(writes.every((value) => !value.includes("\n")));
   progress.stop();
   assert.equal(cleared, true);
-  assert.equal(writes.at(-1), "\x1b[2K\r");
+  assert.equal(writes.at(-2), "\x1b[2K\r⏳ 生成中 · 42% · 1s");
+  assert.equal(writes.at(-1), "\n");
+});
+
+test("updates the Codex non-TTY timer in place and keeps the final progress line", () => {
+  let currentNow = 0;
+  let tick = null;
+  const writes = [];
+  const timer = { unref() {} };
+  const output = {
+    isTTY: false,
+    write(value) {
+      writes.push(value);
+      return true;
+    },
+  };
+
+  const progress = createLiveProgress({
+    startedAt: 0,
+    activityLabel: "生成中",
+    output,
+    allowNonTty: true,
+    now: () => currentNow,
+    setIntervalFn(callback) {
+      tick = callback;
+      return timer;
+    },
+    clearIntervalFn() {},
+  });
+
+  assert.ok(progress);
+  assert.equal(writes[0], "\r⏳ 生成中 · 0s");
+  currentNow = 10_000;
+  tick();
+  assert.equal(writes.at(-1), "\r⏳ 生成中 · 10s");
+  currentNow = 20_000;
+  tick();
+  assert.equal(writes.at(-1), "\r⏳ 生成中 · 20s");
+  progress.stop();
+  assert.equal(writes.at(-2), "\r⏳ 生成中 · 20s");
+  assert.equal(writes.at(-1), "\n");
+  assert.ok(writes.slice(0, -1).every((value) => !value.includes("\n")));
+});
+
+test("keeps sparse fallback for non-Codex pipes", () => {
+  const output = { isTTY: false, write() {} };
+  assert.equal(createLiveProgress({ output, allowNonTty: false }), null);
 });
 
 test("runs a complete generation flow against a local mock API", async () => {
