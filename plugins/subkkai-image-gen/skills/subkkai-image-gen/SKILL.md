@@ -1,11 +1,11 @@
 ---
 name: "subkkai-image-gen"
-description: "Generate or edit images using the Subkkai Image Gen plugin. Trigger when the user wants to create, draw, generate, or edit images through Subkkai gpt-image-2 task-mode APIs, wants batch image generation, needs AI-generated images saved to disk, or wants to modify an existing image. Do not use for SVG/vector work or unrelated image tools."
+description: "Generate or edit images using the Subkkai Image Gen plugin. Trigger when the user wants to create, draw, generate, or edit images through Subkkai gpt-image-2 task APIs, wants batch image generation, needs AI-generated images saved to disk, or wants to modify an existing image. Do not use for SVG/vector work or unrelated image tools."
 ---
 
 # Subkkai Image Gen
 
-Use the Subkkai task-mode image APIs through `scripts/generate.mjs`.
+Use the Subkkai optimized task APIs through `scripts/generate.mjs`.
 
 ## Script location
 
@@ -46,7 +46,8 @@ The output is JSON:
   "keyPreview": "sk-xxxx...abcd",
   "quickMode": { "quality": "2K", "ratio": "portrait", "count": 1 },
   "batchMode": { "quality": "2K", "ratio": "portrait", "concurrency": 3 },
-  "apiBase": "https://subkkai.com"
+  "apiBase": "https://subkkai.com",
+  "transport": "task-fast"
 }
 ```
 
@@ -148,7 +149,7 @@ Extract the image prompt and run:
 node "$SCRIPT" --prompt "<prompt>" [--quality Q] [--ratio R] [--count N]
 ```
 
-Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requested them. Otherwise omit these flags and let the script use saved quick mode. The script creates a Subkkai task, polls `GET /v1/image-tasks/{id}`, saves the final image, and prints the output path.
+Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requested them. Otherwise omit these flags and let the script use saved quick mode. The script creates a task through `POST /v1/image-tasks/generations`, polls its returned URL at a short fixed cadence, saves the returned image, and prints the output path.
 
 **Output workflow:**
 
@@ -171,6 +172,22 @@ Only pass `--quality`, `--ratio`, or `--count` when the user explicitly requeste
    ```
 
 Do not add any explanation before or after the final block.
+
+### Long-running task requests
+
+Subkkai's direct `/v1/images/*` calls can lose the client connection around a
+long-running request even when the upstream later finishes. The task wrapper
+returns an ID immediately and is therefore the stable default.
+
+- Let the Node process continue until it prints `✅` and `📍`; a short shell
+  yield is not a task failure.
+- Keep task polling inside the script. Do not add a second agent-side HTTP poll.
+- The script uses a short fixed delay between status requests. Do not restore
+  exponential polling up to several seconds, because that creates avoidable
+  delay after the upstream has already completed.
+- Do not resubmit automatically after task timeout; first use the task ID and
+  upstream status to avoid duplicate charges.
+
 ## Branch C: Modify config
 
 Show current config from `--get-config`, then output this with values filled in:
@@ -294,7 +311,7 @@ Then run silently (do NOT show Shell card):
 node "$SCRIPT" --edit --image "<image_path>" --prompt "<edit instruction>" [--quality Q] [--ratio R]
 ```
 
-The script uploads the image through `multipart/form-data` using field `image[]`, creates an edit task, polls for completion, and saves the result.
+The script uploads the image to `POST /v1/image-tasks/edits` through `multipart/form-data` using field `image[]`, polls the returned task URL, and saves the result.
 
 Parse the script stdout to extract elapsed time, file path, size, and Markdown image line. Render the final response as plain text:
 
@@ -342,6 +359,18 @@ Content-Type: application/json
 Authorization: Bearer <API_KEY>
 ```
 
+Request body:
+
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "...",
+  "n": 1,
+  "size": "1024x1024",
+  "stream": false
+}
+```
+
 Edit task:
 
 ```txt
@@ -350,11 +379,10 @@ Authorization: Bearer <API_KEY>
 Content-Type: multipart/form-data
 ```
 
-Task polling:
+Multipart fields:
 
 ```txt
-GET /v1/image-tasks/{task_id}
-Authorization: Bearer <API_KEY>
+model, prompt, n, size, image[]
 ```
 
 Expected successful result shape:
@@ -370,11 +398,19 @@ Expected successful result shape:
 
 Also support `response.data[].url`.
 
+The task records expose the underlying real processing endpoints as
+`/v1/images/generations` and `/v1/images/edits`. Do not call those direct
+endpoints as the default plugin path: short requests can be faster, but
+long-running requests can disconnect before the result reaches the client.
+
 ## Parameter rules
 
 - Model: default `gpt-image-2`.
-- Quality: send `quality: "high"` to the upstream API by default.
-- Ratio is converted to `size`; do not send `ratio` upstream.
+- Quality and ratio are converted to the requested `size`; do not send
+  `quality` or `ratio` upstream.
+- Treat the requested size as a hint. The upstream may return different pixel
+  dimensions; never claim the saved image was dimension-verified unless it was
+  inspected.
 - Explicit user parameters override saved config.
 - Saved quick mode and batch mode are independent.
 - Maximum quick count: `4`.
@@ -392,7 +428,9 @@ Also support `response.data[].url`.
 ## Error handling
 
 - `prompt_unsafe` or error containing "安全政策" / "无法用于生成图像" / "cannot be used": automatically rewrite the prompt — remove potentially sensitive keywords, rephrase to a safer equivalent description. Send commentary: `⚠️ 提示词被安全策略拦截，正在改写重试...` then retry once with the rewritten prompt. If the retry also fails, tell the user: the original and rewritten prompts both failed, show the rewritten version, and suggest they try a different description themselves.
+- `skipped_mainline`: the script retries once because the task explicitly says the main generation path was skipped.
 - `bad_size`: retry only if a clear closest supported size exists; otherwise report supported sizes.
 - `No available compatible accounts`: wait 30 seconds and retry once, then report upstream capacity issue.
-- Task timeout: report timeout and offer retry.
+- Task timeout: report the task ID and last status; do not automatically
+  resubmit because that can duplicate charges.
 - Missing key: route to Branch A.

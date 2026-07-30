@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -10,8 +10,10 @@ const MODEL = "gpt-image-2";
 const CONFIG_PATH = join(homedir(), ".codex", "subkkai-image-gen-config.json");
 const DEFAULT_OUTPUT_DIR = join(homedir(), "Pictures", "subkkai-image-gen");
 const TASK_TIMEOUT_MS = 300_000;
-const INITIAL_POLL_MS = 700;
-const MAX_POLL_MS = 8_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const DOWNLOAD_TIMEOUT_MS = 30_000;
+const POLL_INTERVAL_MS = 250;
+const STATUS_LOG_INTERVAL_MS = 15_000;
 
 const SIZE_MATRIX = {
   "1K": { square: "1024x1024", landscape: "1536x1024", portrait: "1024x1536" },
@@ -57,7 +59,7 @@ function createStatusTimer(label) {
   };
 
   if (live) render();
-  const timer = live ? setInterval(render, 1000) : null;
+  const timer = setInterval(render, live ? 1000 : STATUS_LOG_INTERVAL_MS);
   timer?.unref?.();
 
   return {
@@ -65,7 +67,7 @@ function createStatusTimer(label) {
       if (stopped) return;
       if (live) render();
       stopped = true;
-      if (timer) clearInterval(timer);
+      clearInterval(timer);
       const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
       if (live) process.stdout.write("\n");
       else console.log(`⏳ ${label} · ${elapsedSeconds}s`);
@@ -135,39 +137,102 @@ async function readError(response) {
   }
 }
 
+function apiUrl(apiBase, route) {
+  const base = normalizeBaseUrl(apiBase);
+  return `${base.endsWith("/v1") ? base : `${base}/v1`}/${route.replace(/^\/+/, "")}`;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(`Request timeout after ${Math.round(timeoutMs / 1000)}s`);
+      timeoutError.retryable = true;
+      throw timeoutError;
+    }
+    const code = error?.cause?.code || error?.code;
+    const networkError = new Error(code ? `${error.message} (${code})` : error.message);
+    networkError.retryable = true;
+    throw networkError;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+async function requestJson(url, options, { timeoutMs = REQUEST_TIMEOUT_MS, retries = 0 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, options, timeoutMs);
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}: ${await readError(response)}`);
+        error.retryable = isRetryableStatus(response.status);
+        throw error;
+      }
+      const body = await response.text();
+      if (!body.trim()) throw new Error(`HTTP ${response.status}: empty response body`);
+      try {
+        return JSON.parse(body);
+      } catch {
+        throw new Error(`HTTP ${response.status}: response was not valid JSON`);
+      }
+    } catch (error) {
+      lastError = error;
+      if (error?.retryable !== true || attempt === retries) throw error;
+      await sleep(Math.min(500 * 2 ** attempt, 2_000));
+    }
+  }
+  throw lastError;
+}
+
 function extractTaskId(payload) {
   return payload?.id || payload?.task_id || payload?.taskId || payload?.data?.id || payload?.data?.task_id;
 }
 
-async function requestJson(url, options) {
-  const response = await fetch(url, options);
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${await readError(response)}`);
+function taskPollUrl(apiBase, taskId, pollUrl) {
+  const normalizedBase = normalizeBaseUrl(apiBase);
+  if (pollUrl) {
+    try {
+      const base = new URL(`${normalizedBase}/`);
+      const resolved = new URL(pollUrl, base);
+      if (resolved.origin === base.origin) return resolved.toString();
+    } catch {
+      // Fall back to the known same-origin task endpoint below.
+    }
   }
-  return response.json();
+  return apiUrl(apiBase, `image-tasks/${encodeURIComponent(taskId)}`);
 }
 
-async function createGenerationTask({ apiBase, apiKey, prompt, size, n }) {
-  const payload = {
-    model: MODEL,
-    prompt,
-    size,
-    n,
-    quality: "high",
-    moderation: "auto",
-    output_format: "png",
-    stream: false,
-  };
-
-  const result = await requestJson(`${apiBase}/v1/image-tasks/generations`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(payload),
-  });
-
+async function createGenerationTask({ apiBase, apiKey, prompt, size, n = 1 }) {
+  const result = await requestJson(
+    apiUrl(apiBase, "image-tasks/generations"),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: MODEL,
+        prompt,
+        n,
+        size,
+        stream: false,
+      }),
+    },
+    { timeoutMs: REQUEST_TIMEOUT_MS },
+  );
   const taskId = extractTaskId(result);
   if (!taskId) throw new Error(`No task id in generation response: ${JSON.stringify(result)}`);
-  return taskId;
+  return {
+    taskId,
+    pollUrl: taskPollUrl(apiBase, taskId, result.poll_url),
+    expiresAt: result.expires_at || null,
+  };
 }
 
 async function createEditTask({ apiBase, apiKey, imagePath, prompt, size }) {
@@ -180,20 +245,24 @@ async function createEditTask({ apiBase, apiKey, imagePath, prompt, size }) {
   form.append("prompt", prompt);
   form.append("n", "1");
   form.append("size", size);
-  form.append("quality", "high");
-  form.append("moderation", "auto");
-  form.append("output_format", "png");
   form.append("image[]", imageBlob, basename(imagePath));
 
-  const result = await requestJson(`${apiBase}/v1/image-tasks/edits`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-  });
-
+  const result = await requestJson(
+    apiUrl(apiBase, "image-tasks/edits"),
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form,
+    },
+    { timeoutMs: REQUEST_TIMEOUT_MS },
+  );
   const taskId = extractTaskId(result);
   if (!taskId) throw new Error(`No task id in edit response: ${JSON.stringify(result)}`);
-  return taskId;
+  return {
+    taskId,
+    pollUrl: taskPollUrl(apiBase, taskId, result.poll_url),
+    expiresAt: result.expires_at || null,
+  };
 }
 
 function guessMimeType(path) {
@@ -203,41 +272,78 @@ function guessMimeType(path) {
   return "image/png";
 }
 
-async function pollTask({ apiBase, apiKey, taskId }) {
+async function pollTask({ apiBase, apiKey, taskId, pollUrl, expiresAt }) {
   const startedAt = Date.now();
-  let delay = INITIAL_POLL_MS;
+  const deadline = startedAt + TASK_TIMEOUT_MS;
+  let lastStatus = "unknown";
+  let upstreamExpiry = expiresAt ? Date.parse(expiresAt) : Number.NaN;
 
-  while (Date.now() - startedAt < TASK_TIMEOUT_MS) {
-    const task = await requestJson(`${apiBase}/v1/image-tasks/${encodeURIComponent(taskId)}`, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
+  while (Date.now() < deadline) {
+    const task = await requestJson(
+      taskPollUrl(apiBase, taskId, pollUrl),
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${apiKey}` },
+      },
+      { timeoutMs: REQUEST_TIMEOUT_MS, retries: 2 },
+    );
 
     const status = String(task.status || task.data?.status || "").toLowerCase();
-    if (status === "succeeded" || status === "success" || status === "completed") return task;
-    if (status === "failed" || status === "canceled" || status === "cancelled") {
-      const message = task.error?.message || task.error || task.message || JSON.stringify(task);
-      throw new Error(`Task ${status}: ${message}`);
+    lastStatus = status || "unknown";
+    const responseExpiry = task.expires_at || task.data?.expires_at;
+    if (responseExpiry) {
+      const parsed = Date.parse(responseExpiry);
+      if (Number.isFinite(parsed)) upstreamExpiry = parsed;
     }
 
-    await sleep(delay);
-    delay = Math.min(Math.round(delay * 1.45), MAX_POLL_MS);
+    if (status === "succeeded" || status === "success" || status === "completed") return task;
+    if (status === "failed" || status === "canceled" || status === "cancelled") {
+      const rawError = task.error?.message || task.error || task.message || task;
+      const message = typeof rawError === "string" ? rawError : JSON.stringify(rawError);
+      throw new Error(`Task ${taskId} ${status}: ${message}`);
+    }
+    if (Number.isFinite(upstreamExpiry) && Date.now() >= upstreamExpiry) {
+      throw new Error(`Task expired upstream: ${taskId} (last status: ${lastStatus})`);
+    }
+
+    await sleep(POLL_INTERVAL_MS);
   }
 
-  throw new Error(`Task timeout after ${Math.round(TASK_TIMEOUT_MS / 1000)}s: ${taskId}`);
+  throw new Error(`Task timeout after ${Math.round(TASK_TIMEOUT_MS / 1000)}s: ${taskId} (last status: ${lastStatus})`);
 }
 
-function extractImageItems(task) {
-  const response = task.response || task.data?.response || task.result || task.data?.result || task;
-  const data = response?.data || response?.images || task.images || [];
-  return Array.isArray(data) ? data : [];
+async function createAndPollTask(createTask, retryLabel) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const taskInfo = await createTask();
+    try {
+      const task = await pollTask({ ...taskInfo });
+      return { taskInfo, task };
+    } catch (error) {
+      const skippedMainline = /skipped_mainline/i.test(error.message);
+      if (!skippedMainline || attempt === 1) throw error;
+      console.log(`⚠️ 上游跳过本次${retryLabel}，正在安全重试一次...`);
+      await sleep(1_000);
+    }
+  }
+  throw new Error(`Unexpected ${retryLabel} retry state`);
+}
+
+function extractImageItems(payload) {
+  const candidates = [
+    payload?.data,
+    payload?.images,
+    payload?.response?.data,
+    payload?.result?.data,
+    payload?.result?.images,
+  ];
+  return candidates.find(Array.isArray) || [];
 }
 
 async function fetchImageBuffer(url, attempts = 3) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const response = await fetch(url);
+      const response = await fetchWithTimeout(url, {}, DOWNLOAD_TIMEOUT_MS);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return Buffer.from(await response.arrayBuffer());
     } catch (error) {
@@ -269,24 +375,34 @@ async function saveImageItem(item, outputDir, prefix) {
 
 async function runGeneration({ apiBase, apiKey, prompt, size, outputDir }) {
   const start = Date.now();
-  const taskId = await createGenerationTask({ apiBase, apiKey, prompt, size, n: 1 });
-  const task = await pollTask({ apiBase, apiKey, taskId });
+  const { taskInfo, task } = await createAndPollTask(
+    async () => {
+      const created = await createGenerationTask({ apiBase, apiKey, prompt, size, n: 1 });
+      return { apiBase, apiKey, ...created };
+    },
+    "生成",
+  );
   const items = extractImageItems(task);
-  if (!items.length) throw new Error(`No image data in task result: ${JSON.stringify(task)}`);
+  if (!items.length) throw new Error(`No image data in generation task: ${JSON.stringify(task)}`);
   const saved = [];
   for (const item of items) saved.push(await saveImageItem(item, outputDir, "img"));
-  return { elapsed: Date.now() - start, taskId, saved };
+  return { elapsed: Date.now() - start, taskId: taskInfo.taskId, saved };
 }
 
 async function runEdit({ apiBase, apiKey, imagePath, prompt, size, outputDir }) {
   const start = Date.now();
-  const taskId = await createEditTask({ apiBase, apiKey, imagePath, prompt, size });
-  const task = await pollTask({ apiBase, apiKey, taskId });
+  const { taskInfo, task } = await createAndPollTask(
+    async () => {
+      const created = await createEditTask({ apiBase, apiKey, imagePath, prompt, size });
+      return { apiBase, apiKey, ...created };
+    },
+    "编辑",
+  );
   const items = extractImageItems(task);
-  if (!items.length) throw new Error(`No image data in edit result: ${JSON.stringify(task)}`);
+  if (!items.length) throw new Error(`No image data in edit task: ${JSON.stringify(task)}`);
   const saved = [];
   for (const item of items) saved.push(await saveImageItem(item, outputDir, "edit"));
-  return { elapsed: Date.now() - start, taskId, saved };
+  return { elapsed: Date.now() - start, taskId: taskInfo.taskId, saved };
 }
 
 async function runBatch({ apiBase, apiKey, prompts, size, concurrency, outputDir }) {
@@ -387,8 +503,8 @@ function resolveModeParams(flags, mode) {
   return { quality, ratio, size };
 }
 
-async function main() {
-  const { prompts, flags } = parseArgs(process.argv.slice(2));
+async function main(argv = process.argv.slice(2)) {
+  const { prompts, flags } = parseArgs(argv);
   const config = loadConfig() || {};
   const apiBase = normalizeBaseUrl(config.apiBase || DEFAULT_API_BASE);
 
@@ -399,6 +515,7 @@ async function main() {
       quickMode: config.quickMode || null,
       batchMode: config.batchMode || null,
       apiBase,
+      transport: "task-fast",
     }, null, 2));
     return;
   }
@@ -509,7 +626,28 @@ async function main() {
   for (const file of result.saved) console.log(markdownImage(file.path));
 }
 
-main().catch((error) => {
-  console.error(`❌ ${error.message}`);
-  process.exit(1);
-});
+function isMainModule() {
+  return !!process.argv[1] && resolve(fileURLToPath(import.meta.url)) === resolve(process.argv[1]);
+}
+
+if (isMainModule()) {
+  main().catch((error) => {
+    console.error(`❌ ${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+export {
+  apiUrl,
+  createEditTask,
+  createGenerationTask,
+  extractImageItems,
+  main,
+  parseArgs,
+  pollTask,
+  requestJson,
+  resolveModeParams,
+  runEdit,
+  runGeneration,
+  taskPollUrl,
+};
